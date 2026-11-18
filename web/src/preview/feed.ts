@@ -7,17 +7,36 @@
  *   and compile once more when it ends.
  * - Only changed files are sent; a file that left the document is removed,
  *   so the worker holds exactly the files an export would see.
- * - Every way a step can end clears the gate: a compile that finishes, a
- *   worker that dies, a compile that outlasts the watchdog, an asset that
- *   fails to load.
+ * - Every wait has a deadline and can be aborted: a compile has the
+ *   watchdog, an asset fetch has FETCH_MS. So an edit or a Retry in any
+ *   state other than idle leads to a compile of the newest text within
+ *   FETCH_MS + WATCHDOG_MS + the longest retry delay.
  * - A failure terminates the worker, starts a fresh one, forgets what was
  *   sent, and shows an error. The feed retries by itself with a growing
  *   delay, at once on the next edit, when the browser comes back online, or
  *   when the person presses Retry.
+ * - An asset that failed to load does not hold up the next compile. That
+ *   compile runs without it, so Typst names the missing file, and the asset
+ *   is fetched again beside it. When it arrives the feed compiles again.
+ *
+ * State and event to next state. "compile" means: send what changed, then
+ * fetching when an asset is missing (and has not just failed), else
+ * compiling.
+ *
+ * | state     | changed (edit)  | retry (button, online) | done(current)          | done(old) | worker failed | watchdog  | fetch ok         | fetch fails or deadline | retry timer |
+ * |-----------|-----------------|------------------------|------------------------|-----------|---------------|-----------|------------------|-------------------------|-------------|
+ * | idle      | compile         | idle                   | idle                   | idle      | failed        | -         | -                | -                       | -           |
+ * | fetching  | fetching, dirty | fetching, dirty        | fetching               | fetching  | failed        | -         | idle, compile    | failed, skip the asset  | -           |
+ * | compiling | compiling, dirty| compiling, dirty       | idle; compile if dirty | compiling | failed        | failed    | -                | -                       | -           |
+ * | failed    | compile         | compile                | failed                 | failed    | failed        | -         | failed (ignored) | failed (ignored)        | compile     |
+ *
+ * "-" cannot happen: no timer or fetch of that kind is pending in that
+ * state. A fetch that settles after the state moved on is ignored. A
+ * background fetch of a skipped asset that arrives calls `changed`.
  */
 import type { LoroDoc } from "loro-crdt"
 import { projectFiles } from "../sync/files"
-import type { ToWorker } from "./messages"
+import type { FromWorker, ToWorker } from "./messages"
 
 /** One file as the document holds it now. */
 export interface FileState {
@@ -40,8 +59,9 @@ export interface FeedHost {
   post(msg: ToWorker): void
   /** Terminates the worker and starts a fresh one. */
   restart(): void
-  /** Loads an asset's bytes; rejects when the server does not answer 200. */
-  fetchAsset(hash: string): Promise<Uint8Array>
+  /** Loads an asset's bytes; rejects when the server does not answer 200
+   * or `signal` aborts. */
+  fetchAsset(hash: string, signal: AbortSignal): Promise<Uint8Array>
   /** The pages that are on screen and the render scale. */
   view(): { visible: number[]; scale: number }
   /** Shows or clears the error. */
@@ -58,21 +78,31 @@ export type FeedState =
 
 /** A compile that takes longer than this is treated as a hung worker. */
 export const WATCHDOG_MS = 30_000
+/** An asset fetch that takes longer than this is aborted. */
+export const FETCH_MS = 15_000
 /** Delays before the automatic retries; the last one repeats. */
 export const RETRY_MS = [1_000, 2_000, 5_000, 10_000, 20_000]
+
+/** What the worker holds at a path. */
+type Sent = { kind: "text"; text: string } | { kind: "asset"; hash: string }
 
 export class Feed {
   private current: FeedState = { kind: "idle" }
   private dirty = false
   private id = 0
-  /** What the worker holds: a file's text, or `#` and an asset hash. */
-  private readonly sent = new Map<string, string>()
+  private readonly sent = new Map<string, Sent>()
   private readonly assets = new Map<string, Uint8Array>()
+  /** Assets whose last fetch failed; the next compile runs without them. */
+  private readonly skipped = new Set<string>()
+  /** Fetches of skipped assets beside the compile. */
+  private readonly background = new Set<string>()
+  private readonly aborts = new Set<AbortController>()
   private watchdog: unknown
   private retryTimer: unknown
   /** Failures since the last compile that worked; picks the retry delay. */
   private attempt = 0
   private fetches = 0
+  private stopped = false
 
   constructor(private readonly host: FeedHost) {}
 
@@ -85,6 +115,13 @@ export class Feed {
     return this.id
   }
 
+  /** Whether a message from the worker belongs to the newest compile. A
+   * layout or page of an older one, as from a worker that was replaced or a
+   * compile the watchdog gave up on, must not reach the screen. */
+  accepts(msg: FromWorker): boolean {
+    return msg.type === "failed" || msg.id === this.id
+  }
+
   /** Call after any change to the document. */
   changed(): void {
     if (this.current.kind === "failed") this.retry()
@@ -93,7 +130,11 @@ export class Feed {
 
   /** Retry now: the Retry button, the browser coming back online. */
   retry(): void {
-    if (this.current.kind !== "failed") return
+    if (this.current.kind === "idle") return
+    if (this.current.kind !== "failed") {
+      this.dirty = true
+      return
+    }
     this.host.clearTimer(this.retryTimer)
     this.current = { kind: "idle" }
     this.host.failed(undefined)
@@ -102,6 +143,7 @@ export class Feed {
 
   /** The worker finished compile `id`. */
   done(id: number): void {
+    // A done of an older compile is ignored.
     if (this.current.kind !== "compiling" || this.current.id !== id) return
     this.host.clearTimer(this.watchdog)
     this.current = { kind: "idle" }
@@ -116,8 +158,10 @@ export class Feed {
   }
 
   stop(): void {
+    this.stopped = true
     this.host.clearTimer(this.watchdog)
     this.host.clearTimer(this.retryTimer)
+    for (const abort of this.aborts) abort.abort()
   }
 
   private compile(): void {
@@ -136,18 +180,25 @@ export class Feed {
     }
     const missing: string[] = []
     for (const file of files) {
+      const held = this.sent.get(file.path)
       if (file.text !== undefined) {
-        if (this.sent.get(file.path) !== file.text) {
-          this.sent.set(file.path, file.text)
+        if (held?.kind !== "text" || held.text !== file.text) {
+          this.sent.set(file.path, { kind: "text", text: file.text })
           this.host.post({ type: "text", path: file.path, text: file.text })
         }
       } else if (file.hash !== undefined) {
-        const key = `#${file.hash}`
-        if (this.sent.get(file.path) === key) continue
+        if (held?.kind === "asset" && held.hash === file.hash) continue
         const bytes = this.assets.get(file.hash)
         if (bytes) {
-          this.sent.set(file.path, key)
+          this.sent.set(file.path, { kind: "asset", hash: file.hash })
           this.host.post({ type: "bytes", path: file.path, bytes })
+        } else if (this.skipped.has(file.hash)) {
+          // The worker must not keep an older file at this path.
+          if (held) {
+            this.sent.delete(file.path)
+            this.host.post({ type: "remove", path: file.path })
+          }
+          this.fetchBeside(file.hash)
         } else missing.push(file.hash)
       }
     }
@@ -164,13 +215,37 @@ export class Feed {
     this.host.post({ type: "compile", id, ...this.host.view() })
   }
 
+  /** Fetches `hash` with a deadline, into `assets`. */
+  private load(hash: string): Promise<void> {
+    const abort = new AbortController()
+    this.aborts.add(abort)
+    return new Promise<void>((resolve, reject) => {
+      const deadline = this.host.setTimer(() => {
+        abort.abort()
+        reject(new Error(`the server did not answer within ${FETCH_MS / 1000} s`))
+      }, FETCH_MS)
+      abort.signal.addEventListener("abort", () => this.host.clearTimer(deadline))
+      this.host
+        .fetchAsset(hash, abort.signal)
+        .then((bytes) => {
+          this.assets.set(hash, bytes)
+          resolve()
+        }, reject)
+        .finally(() => {
+          this.host.clearTimer(deadline)
+          this.aborts.delete(abort)
+        })
+    })
+  }
+
   private fetch(hashes: string[]): void {
     // A fetch that ends after a failure and a retry is not the current one.
     const id = ++this.fetches
     this.current = { kind: "fetching", id }
     const current = (): boolean => this.current.kind === "fetching" && this.current.id === id
     const unique = [...new Set(hashes)]
-    Promise.all(unique.map((hash) => this.host.fetchAsset(hash).then((bytes) => this.assets.set(hash, bytes)))).then(
+    const failed: string[] = []
+    Promise.all(unique.map((hash) => this.load(hash).catch((error: unknown) => (failed.push(hash), Promise.reject(error))))).then(
       () => {
         if (!current()) return
         this.current = { kind: "idle" }
@@ -178,14 +253,30 @@ export class Feed {
       },
       (error: unknown) => {
         if (!current()) return
+        for (const hash of failed) this.skipped.add(hash)
         this.fail(`An image could not be loaded: ${error instanceof Error ? error.message : String(error)}`)
       },
+    )
+  }
+
+  /** Fetches a skipped asset without holding up the compile. */
+  private fetchBeside(hash: string): void {
+    if (this.background.has(hash)) return
+    this.background.add(hash)
+    this.load(hash).then(
+      () => {
+        this.background.delete(hash)
+        this.skipped.delete(hash)
+        if (!this.stopped) this.changed()
+      },
+      () => this.background.delete(hash),
     )
   }
 
   private fail(message: string): void {
     this.host.clearTimer(this.watchdog)
     this.host.clearTimer(this.retryTimer)
+    if (this.current.kind === "fetching") for (const abort of this.aborts) abort.abort()
     this.host.restart()
     this.sent.clear()
     this.dirty = false

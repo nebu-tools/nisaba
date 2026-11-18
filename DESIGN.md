@@ -141,9 +141,12 @@ bytes to another project adds a row for that project; the file on disk is
 shared.
 
 A project's stored document, its snapshot plus its log, may grow to 32 MiB.
-An update past that is refused with close code 4130, and an upload or import
-that would pass it gets HTTP 413. The limit holds after a restart, because the
-room counts what the store holds.
+The limit covers the text and its history. Asset files do not count toward
+it, and asset storage has no limit yet. An update past the limit is refused
+with close code 4130. When the update comes in parts (section 4), the server
+refuses it at its declared length, before any part arrives. An upload or
+import whose file entries would pass the limit gets HTTP 413. The limit holds
+after a restart, because the room counts what the store holds.
 
 ### Compaction
 
@@ -208,7 +211,7 @@ in-memory document directly.
 
 ## 4. Sync protocol
 
-Nisaba speaks its own protocol, version 1. Each WebSocket binary message is
+Nisaba speaks its own protocol, version 2. Each WebSocket binary message is
 one frame: a `u8` type followed by its fields. A blob is a big-endian `u32`
 length followed by that many bytes.
 
@@ -220,12 +223,39 @@ length followed by that many bytes.
 | 4 | Ack | server to client | server version vector (blob) |
 | 5 | Presence | both | Loro ephemeral-store bytes (blob) |
 | 6 | Heartbeat | both | none |
+| 7 | Begin | both | total length of the frame that follows in parts (`u32`) |
+| 8 | Part | both | part number from 0 (`u32`), bytes (blob) |
+
+A WebSocket message is at most 1 MiB plus a small header. A frame longer than
+1 MiB, such as the update with a large offline backlog or the snapshot for a
+client that joins, goes as a Begin and then parts of 1 MiB, the last one
+shorter. The receiver joins the parts and reads the result as one frame. Both
+directions use the same code (`split` and `Assembler` in `nisaba-sync`, and
+`frames.ts` in the client), and the server uses it for Welcome too. The rules:
+
+- The receiver keeps at most the declared total. The server checks the total
+  against what the project has left under its 32 MiB limit when the Begin
+  arrives, and closes with 4130 before it keeps a single part.
+- Parts come in order, each exactly once. A missing, repeated or
+  out-of-order part, more bytes than declared, another frame between the
+  parts, or a part without a Begin closes the socket with 4000.
+- Nothing is applied until the last part arrives, and the joined update is
+  applied in one transaction. A socket that drops in the middle leaves
+  nothing behind; the next connection sends the whole difference again.
 
 The socket URL `/sync/{project}` names the project, so Hello carries no
 project id. The WebSocket close frame carries every error as a code and a
 reason (below), so there is no error frame and no goodbye frame. A frame with
 an unknown type, a short frame or bytes after the end of a frame closes the
 socket with 4000.
+
+A socket belongs to the session that opened it. The server closes it at once
+when that access ends: with 4401 when the session is signed out, expires or
+its account is deleted, and with 4004 when the user stops being a member of
+the project. The store ends the socket's grant in the same step that takes
+the access away, and the socket loop checks the grant before it applies each
+frame, so no frame is applied after that moment. Expiry is checked during
+the socket's life, at least once a minute.
 
 The session cookie authenticates the socket. The server refuses the upgrade
 with HTTP 403 unless the `Origin` header equals the public address (section
@@ -276,11 +306,12 @@ sync client.
 The client stores every update it makes or receives in an IndexedDB object
 store, in the order it saw them. When a project opens, the client imports
 these entries before it connects, so the editor shows the last state the
-device knew, also offline. When there are more than 50 entries, the client
-replaces them with one snapshot in one IndexedDB transaction.
+device knew, also offline. When there are more than 50 entries at start, and
+after every 50 appends while the project is open, the client replaces the
+entries with one snapshot in one IndexedDB transaction.
 
 Before the first Ack of a session, and while offline, the device log is the
-only copy of new edits. The save indicator therefore has four states:
+only copy of new edits. The save indicator therefore has these states:
 
 | State | Text | Meaning |
 |---|---|---|
@@ -288,6 +319,9 @@ only copy of new edits. The save indicator therefore has four states:
 | saving | Saving… | Connected; some changes are not acknowledged yet. |
 | offline | Offline · changes kept on this device | Not connected; every change is in IndexedDB. |
 | unsafe | Not saved on this device | IndexedDB failed or is unavailable, and some changes exist only in memory. |
+| stopped | Stopped (with the reason) | The server ended access (4004, 4401, 4003). |
+| full | Not saved: the project is full | The project reached its limit (4130). The edits stay on the device. |
+| failed | Sync failed | Three malformed-frame closes in a row, or a protocol mismatch (4400). A Reload button is shown. |
 
 In the unsafe state the page asks for confirmation before it closes.
 
@@ -297,15 +331,15 @@ In the unsafe state the page asks for confirmation before it closes.
 |---|---|---|
 | 1000 | Normal close | Reconnect when the page needs the project again. |
 | 1006 | Connection lost | Reconnect with backoff. |
-| 4000 | Malformed frame | Reconnect with backoff; after three failures, show "Sync failed" with a reload button. |
-| 4004 | Unknown project, or the user is not a member | Stop; the save state says "Stopped" with the reason. |
+| 4000 | Malformed frame, or parts out of order | Reconnect with backoff. After three in a row with no Ack between them, stop and show "Sync failed" with a Reload button. |
+| 4004 | Unknown project, or the user is not a member, or stopped being one | Stop; the save state says "Stopped" with the reason. |
 | 4002 | Too slow | The client did not read its frames and its queue on the server filled. Reconnect with backoff. |
-| 4003 | Not allowed | Reload the role; continue read-only or leave the project. Local changes stay in IndexedDB. |
+| 4003 | Not allowed | Planned: reload the role and continue read-only. Today the client stops as for 4004. Local changes stay in IndexedDB. |
 | 4029 | Too many connections: the project has too many sockets, or the account has 32 open | Reconnect with backoff. |
-| 4130 | Update too large, or the project is at its 32 MiB limit | Show "This change is too large to save"; keep it on the device. |
+| 4130 | The update, or its declared length, does not fit in what is left of the project's 32 MiB | Stop; do not retry. The save state says "Not saved: the project is full", and a note says that the edits are kept on this device and that copying the text into a new project lets the user go on. |
 | 4400 | Protocol version mismatch | Show "Nisaba was updated. Reload to continue." Local changes stay in IndexedDB and go out after the reload. |
-| 4401 | No valid session | Stop; the save state says "Stopped" with the reason. A reload shows the sign-in screen. Local changes stay in IndexedDB. |
-| 4409 | Project replaced | The project's epoch changed (section 10). Offer the unsent changes as a download, then clear the device log and reload. |
+| 4401 | No valid session: never had one, signed out, expired, or the account was deleted | Stop; the save state says "Stopped" with the reason. A reload shows the sign-in screen. Local changes stay in IndexedDB. |
+| 4409 | Project replaced | Planned with the archive (section 10): offer the unsent changes as a download, then clear the device log and reload. |
 | 4500 | Server error | Reconnect with backoff. |
 
 Backoff starts at 0.5 s, doubles to 30 s and has random jitter. The client
@@ -437,8 +471,11 @@ SHA-256 of the code, with everything but hex digits dropped and in lower
 case, against the stored hash in constant time. Checking that no user exists,
 checking the code, inserting the account and deleting the code are one
 `BEGIN IMMEDIATE` transaction, so two setups at once make exactly one owner;
-the other gets 409. A wrong code gets 403. Setup has no rate limit: a limit
-would let anyone lock the owner out, and 128 bits cannot be guessed.
+the other gets 409. A wrong code gets 403. Before it hashes the password, the
+server makes the same two checks outside the transaction. So once an owner
+exists, setup answers 409 without any password work, and a wrong code costs
+no hash either. Setup has no rate limit: a limit would let anyone lock the
+owner out, and 128 bits cannot be guessed.
 
 The first account is the server administrator. Without the code, a stranger
 on the same network could take the server before its owner does.
@@ -446,8 +483,9 @@ on the same network could take the server before its owner does.
 ### Local accounts
 
 Passwords use Argon2id with the `argon2` crate's default parameters. At most
-four hashes run at once, on blocking threads; further sign-ins wait. A
-sign-in for an unknown email checks the password against a fixed hash, so
+four hashes run at once, on blocking threads, and at most 16 more requests
+wait for one. A request beyond that gets 503 with `Retry-After: 1` at once.
+A sign-in for an unknown email checks the password against a fixed hash, so
 both cases take the same time.
 
 The server stores a session as the SHA-256 of a random 32-byte token. Behind
@@ -456,8 +494,9 @@ an https public address the browser holds the token in a cookie named
 `Path=/`; the `__Host-` prefix makes the browser refuse it unless it is
 secure, has that path and names no domain. Behind plain http the cookie is
 `nisaba_session` with the same attributes except `Secure`. Sessions last 30
-days from sign-in. Signing out deletes the session row; making a session
-deletes the expired ones.
+days from sign-in. Signing out deletes the session row and closes the
+session's sync sockets (section 4); making a session deletes the expired
+ones.
 
 Every request other than `GET` and `HEAD` must carry an `Origin` header equal
 to the public address, or the server answers 403. Browsers send `Origin` on
@@ -465,8 +504,15 @@ every such request, so a page of another site cannot make one with the
 user's cookie, and `SameSite=Lax` keeps the cookie off cross-site
 subrequests. There are no separate CSRF tokens. `GET` routes change nothing.
 
-The server allows 10 sign-in attempts per minute per account; the eleventh
-gets 429.
+Failed sign-ins slow down the email they were for. The first three cost
+nothing. After that the next attempt must wait 1 s, then 2 s, 4 s and so on
+up to 5 minutes; earlier attempts get 429 with `Retry-After` and no password
+work. A sign-in that works clears the count, and an email with no failure
+for an hour starts over. Unknown emails count the same way, so the answer
+does not show which emails have accounts. The server keeps counts for at
+most 10,000 emails and drops the oldest beyond that. This slows guessing one
+password. It does not stop a flood of sign-ins spread over many emails;
+SECURITY.md says to put a rate limit in the reverse proxy for that.
 
 Other limits: a request body may be 64 KiB, an asset upload 32 MiB and a
 project import 64 MiB (413 beyond). An account may hold 32 sync sockets at
@@ -616,20 +662,37 @@ drive each path. Every path out of fetching and compiling clears the gate:
   error, or a message cannot be read: failed.
 - A compile runs longer than 30 s: failed. The worker is busy and cannot be
   asked to stop, so it is terminated.
-- An asset does not load: failed.
+- An asset does not answer 200, or does not arrive within 15 s: the fetch is
+  aborted, and the feed fails. The next compile runs without that asset, so
+  Typst names the missing file, and the asset is fetched again beside it.
+  When it arrives the preview compiles again.
+
+Every wait has a deadline and can be aborted. So an edit or a Retry in any
+state but idle leads to a compile of the newest text within a bounded time.
+The table of states and events is at the top of `feed.ts`, and a test covers
+each cell. The feed keeps what the worker holds as a tagged value, text or
+asset, so a text that looks like an asset hash is never taken for one.
+
+Each layout and page message carries the id of its compile. The page drops a
+message from an older compile, such as a late page from a compile the
+watchdog gave up on, and a message from a worker that was replaced.
+
+When the newest compile has errors, or the preview failed, the last good
+pages stay on screen, dimmed, under the label "Showing the last version that
+compiled.".
 
 On failure the page terminates the worker, starts a new one, forgets what it
 sent, and shows the message with "Retry now". It retries by itself after 1,
 2, 5, 10 and then every 20 s, at once on the next edit, and when the browser
 comes back online. A retry sends every file again. A compile that works
-resets the delays. A `done` from a worker that was replaced is ignored. The
-preview never switches to a server compile.
+resets the delays. The preview never switches to a server compile.
 
 ### The date
 
 `datetime.today()` is the caller's local calendar date. The worker sets the
-date from the browser's clock before every compile, so a preview left open
-past midnight shows the new day. The export link carries the local date as
+date from the browser's clock before every compile, and the page compiles
+again one second after local midnight, so a preview left open past midnight
+shows the new day. The export link carries the local date as
 `?today=YYYY-MM-DD`. The server uses it when it lies within one day of the
 server's UTC date, which covers every time zone, and otherwise uses the UTC
 date. A request without the parameter, or with a malformed one, gets the UTC
@@ -670,14 +733,35 @@ standard input and reads the PDF from its standard output. The child:
 1. sets `RLIMIT_AS` to the memory limit, `RLIMIT_CPU` to the time limit plus
    one second, and `RLIMIT_CORE` to 0;
 2. reads the request and loads the embedded fonts;
-3. on Linux with Landlock (5.13 and later), takes away all file access, all
+1. asks the kernel to kill it when the server ends (`PR_SET_PDEATHSIG`);
+2. sets `RLIMIT_AS` to the memory limit, `RLIMIT_CPU` to the time limit plus
+   one second, and `RLIMIT_CORE` to 0;
+3. reads the request and loads the embedded fonts;
+4. on Linux with Landlock (5.13 and later), takes away all file access, all
    TCP binds and connects, and abstract Unix sockets and signals to other
-   processes (`AccessFs`, `AccessNet` and `Scope` at ABI 6, best effort, so
-   an older kernel enforces what it knows);
-4. compiles and writes the PDF, or writes the problems and exits with 2.
+   processes (`AccessFs`, `AccessNet` and `Scope` at ABI 6; an older kernel
+   enforces the rules it knows, which always include the file rules);
+5. compiles and writes the PDF, or writes the problems and exits with 2.
 
-The server kills the child when the deadline passes, and when the request is
-dropped. It answers:
+The sandbox fails closed. At start the server tries the Landlock rules on a
+thread of its own and prints one line that says whether exports are
+sandboxed. If the system cannot enforce them, every export is refused with
+503 and a message that says so, unless the server was started with
+`--allow-unsandboxed-export`. The child checks again and exits when a
+sandbox it was told to require is missing. An export without the sandbox is
+still limited: the compiler sees only the project's own files, which the
+server writes to the child's standard input, and the memory and time limits
+still apply. What it loses is the kernel's guarantee that a bug in the
+compiler cannot read other files or open connections.
+
+A child never outlives its request. The server kills it and waits for it
+when the deadline passes, when the request is dropped because the client
+went away, and when the server stops on SIGTERM or Ctrl-C. A stopping server
+waits at most 5 s for open requests and sockets. If the server is killed
+outright, the kernel kills the child. Tests check each case through `/proc`:
+no export child is left, and none is a zombie.
+
+The server answers:
 
 | Outcome | Status | Message |
 |---|---|---|
@@ -686,6 +770,8 @@ dropped. It answers:
 | Allocation failed or `SIGKILL`/`SIGABRT` | 422 | "the export ran out of memory: …" with the limit |
 | Deadline passed or `SIGXCPU` | 422 | "the export ran out of time: …" with the limit |
 | All slots and the queue full | 503 with `Retry-After: 30` | "the server is busy with other exports; try again in a minute" |
+| No sandbox and no `--allow-unsandboxed-export` | 503 | "exports are turned off on this server: it cannot sandbox them …" |
+| The server is stopping | 503 | "the server is stopping; try again in a minute" |
 | Anything else | 500 | what the child wrote |
 
 The limits are settings:
@@ -696,17 +782,19 @@ The limits are settings:
 | `--export-seconds` | 60 | wall-clock deadline, at least 1 |
 | `--export-parallel` | 2 | exports that run at once |
 | `--export-queue` | 8 | exports that wait for a slot; beyond this, 503 |
+| `--allow-unsandboxed-export` | off | run exports even when the system cannot sandbox them |
 
 The server tests run exports with small limits: a terabyte string under
 512 MiB answers "out of memory", a nested loop under 2 s answers "out of
 time" while a second export with no queue answers 503, and a normal export
 works after each.
 
-Linux is the target. On other systems the child still runs as a separate
-process with the deadline, the kill, the parallel cap and the queue, so the
-server survives any document, but there is no memory limit and no file or
-network restriction: a document that allocates without end can exhaust the
-machine's memory before the deadline.
+Linux is the target. Other systems have no Landlock, so they refuse exports
+unless the server is started with `--allow-unsandboxed-export`. Then the
+child runs as a separate process with the deadline, the kill, the parallel
+cap and the queue, so the server survives any document, but there is no
+memory limit and no file or network restriction: a document that allocates
+without end can exhaust the machine's memory before the deadline.
 
 An export option for PDF/A-2b output is planned.
 

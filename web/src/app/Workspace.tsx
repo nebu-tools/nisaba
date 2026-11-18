@@ -17,7 +17,12 @@ const STATUS: Record<SaveState, string> = {
   offline: "Offline · changes kept on this device",
   unsafe: "Not saved on this device",
   stopped: "Stopped",
+  full: "Not saved: the project is full",
+  failed: "Sync failed",
 }
+
+/** States whose note is a whole message, shown under the header. */
+const ALERT: SaveState[] = ["full", "failed"]
 
 export function Workspace(props: { project: string }): JSX.Element {
   const opened = performance.now()
@@ -90,9 +95,21 @@ export function Workspace(props: { project: string }): JSX.Element {
           Export PDF
         </a>
         <span id="status" role="status" data-state={state().state}>
-          {state().note ? `${STATUS[state().state]} (${state().note})` : STATUS[state().state]}
+          {state().note && !ALERT.includes(state().state)
+            ? `${STATUS[state().state]} (${state().note})`
+            : STATUS[state().state]}
         </span>
       </header>
+      <Show when={ALERT.includes(state().state) && state().note}>
+        {(note) => (
+          <p id="sync-alert" class="note" role="alert">
+            {note()}{" "}
+            <Show when={state().state === "failed"}>
+              <button onClick={() => location.reload()}>Reload</button>
+            </Show>
+          </p>
+        )}
+      </Show>
       <nav id="files" aria-label="Files">
         <For each={files()}>
           {(f) => (

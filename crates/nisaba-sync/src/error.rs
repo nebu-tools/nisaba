@@ -11,6 +11,10 @@ pub enum FrameError {
     TooLarge(usize),
     #[error("{0} bytes after the end of the frame")]
     Trailing(usize),
+    #[error("expected part {expected}, got {got}")]
+    PartNumber { expected: u32, got: u32 },
+    #[error("parts out of order: {0}")]
+    PartsOrder(&'static str),
 }
 
 /// Why the room refused a frame or a client.
@@ -24,8 +28,11 @@ pub enum SyncError {
     Unexpected,
     #[error("this role may not change the project")]
     Forbidden,
-    #[error("update of {0} bytes is larger than allowed")]
+    #[error("{0} bytes are more than allowed")]
     TooLarge(usize),
+    /// The project's stored size limit (`Limits::max_document`).
+    #[error("the project is at its size limit: {need} bytes do not fit in the {left} left")]
+    ProjectFull { need: usize, left: usize },
     #[error("the project has too many connections")]
     Full,
     #[error("the client did not read its frames in time")]
@@ -41,7 +48,9 @@ impl SyncError {
     #[must_use]
     pub fn close_code(&self) -> u16 {
         match self {
-            Self::Frame(FrameError::TooLarge(_)) | Self::TooLarge(_) => close::TOO_LARGE,
+            Self::Frame(FrameError::TooLarge(_)) | Self::TooLarge(_) | Self::ProjectFull { .. } => {
+                close::TOO_LARGE
+            }
             Self::Frame(_) | Self::Unexpected | Self::Loro(_) => close::MALFORMED,
             Self::Version { .. } => close::VERSION,
             Self::Forbidden => close::FORBIDDEN,

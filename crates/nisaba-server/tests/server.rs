@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use loro::{ExportMode, LoroDoc, LoroValue, ValueOrContainer, VersionVector};
-use nisaba_sync::{Frame, PROTOCOL_VERSION};
+use nisaba_sync::{Assembler, Frame, PART, PROTOCOL_VERSION, split};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
 
 struct Server {
@@ -17,6 +17,8 @@ struct Server {
     base: String,
     /// The first-run setup code, when the server printed one.
     setup_code: Option<String>,
+    /// What the server printed at start.
+    start: Vec<String>,
 }
 
 impl Server {
@@ -35,8 +37,10 @@ impl Server {
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
         let mut base = None;
         let mut setup_code = None;
+        let mut start = Vec::new();
         for line in lines.by_ref() {
             let line = line.unwrap();
+            start.push(line.clone());
             let mut words = line.split_whitespace();
             match (words.next(), words.next()) {
                 (Some("listening"), _) => {
@@ -57,6 +61,7 @@ impl Server {
             child,
             base: base.expect("listening line"),
             setup_code,
+            start,
         }
     }
 
@@ -223,6 +228,36 @@ struct Peer {
     ws: Ws,
     doc: LoroDoc,
     acked: VersionVector,
+    parts: Assembler,
+}
+
+/// Sends `frame` as the protocol says: whole, or in parts when it is longer
+/// than [`PART`].
+async fn send(ws: &mut Ws, frame: &Frame) {
+    for message in split(frame, PART) {
+        ws.send(Message::Binary(message.into())).await.unwrap();
+    }
+}
+
+/// The next message, which must be a close; returns its code.
+async fn closed_with(ws: &mut Ws) -> u16 {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("a close within 10 s");
+        match msg {
+            Some(Ok(Message::Close(Some(frame)))) => return frame.code.into(),
+            Some(Ok(Message::Binary(bytes))) => {
+                let frame = Frame::decode(&bytes, PART).unwrap();
+                assert!(
+                    !matches!(frame, Frame::Ack(_)),
+                    "an Ack came after access ended"
+                );
+            }
+            Some(Ok(_)) => {}
+            other => panic!("socket ended without a close code: {other:?}"),
+        }
+    }
 }
 
 enum In {
@@ -246,6 +281,7 @@ impl Peer {
             ws,
             doc,
             acked: VersionVector::default(),
+            parts: Assembler::new(PART),
         };
         let In::Frame(Frame::Welcome { catch_up, version }) = me.recv().await else {
             panic!("expected Welcome first");
@@ -267,7 +303,9 @@ impl Peer {
             let Message::Binary(bytes) = msg else {
                 continue;
             };
-            let frame = Frame::decode(&bytes, 1 << 26).unwrap();
+            let Some(frame) = self.parts.push(&bytes, |_| Ok(())).unwrap() else {
+                continue;
+            };
             match &frame {
                 Frame::Ack(vv) => return In::Ack(VersionVector::decode(vv).unwrap()),
                 Frame::Update(u) => {
@@ -323,10 +361,7 @@ impl Peer {
     async fn push(&mut self) {
         self.doc.commit();
         let update = self.doc.export(ExportMode::updates(&self.acked)).unwrap();
-        self.ws
-            .send(Message::Binary(Frame::Update(update).encode().into()))
-            .await
-            .unwrap();
+        send(&mut self.ws, &Frame::Update(update)).await;
     }
 
     /// Waits until the server has acknowledged every local change.
@@ -897,6 +932,616 @@ async fn an_export_that_runs_out_of_time_is_killed() {
     let message = res.text().await.unwrap();
     assert!(message.contains("out of time"), "{message}");
     assert!(started.elapsed() < Duration::from_secs(10));
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        children(server.child.id()),
+        vec![],
+        "the child was not reaped"
+    );
     let fine = new_project(&client, base).await;
     assert_eq!(export(&client, base, &fine).await.status(), 200);
+}
+
+/// The server in this process, so a test can take access away through the
+/// store the way an admin tool will.
+struct InProcess {
+    base: String,
+    store: nisaba_server::store::Store,
+    app: nisaba_server::http::App,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl InProcess {
+    async fn start(dir: &std::path::Path) -> Self {
+        use nisaba_server::config::ExportLimits;
+        use nisaba_server::export::Exporter;
+        Self::start_with(
+            dir,
+            Exporter::new(env!("CARGO_BIN_EXE_nisaba").into(), ExportLimits::default()),
+        )
+        .await
+    }
+
+    async fn start_with(dir: &std::path::Path, exporter: nisaba_server::export::Exporter) -> Self {
+        use nisaba_server::config::PublicAddress;
+        let store = nisaba_server::store::Store::open(dir).unwrap();
+        store.prepare_setup(false).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let public = PublicAddress::resolve(addr, None, false).unwrap();
+        let app = nisaba_server::http::App::new(store.clone(), public, exporter);
+        let router = nisaba_server::http::router(app.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Self {
+            base: format!("http://{addr}"),
+            store,
+            app,
+            task,
+        }
+    }
+
+    fn user_id(&self, email: &str) -> String {
+        self.store.user_by_email(email).unwrap().unwrap().0.id
+    }
+}
+
+impl Drop for InProcess {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Sign-out closes the session's sockets with 4401 before the 204, and an
+/// update sent after it is not applied.
+#[tokio::test]
+async fn signing_out_closes_the_sessions_sockets() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    sign_up(base).await;
+    let (client, cookie) = log_in(base).await;
+    let (other, _) = log_in(base).await;
+    let project = new_project(&client, base).await;
+    let mut a = Peer::connect(base, &cookie, &project, 11).await;
+    a.type_text(" Anemones").await;
+    a.saved().await;
+    let res = client
+        .post(format!("{base}/api/logout"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    a.type_text(" Limpets").await;
+    assert_eq!(closed_with(&mut a.ws).await, 4401);
+    let text = main_text(&other, base, &project).await;
+    assert!(text.contains("Anemones"), "{text}");
+    assert!(
+        !text.contains("Limpets"),
+        "an update after sign-out was applied"
+    );
+}
+
+/// Losing the project closes the socket with 4004; losing the account
+/// closes it with 4401.
+#[tokio::test]
+async fn losing_access_closes_the_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = InProcess::start(dir.path()).await;
+    let base = &server.base;
+    let (owner, _) = sign_up(base).await;
+    let project = new_project(&owner, base).await;
+    let hash = nisaba_server::http::hash_password(PASSWORD).unwrap();
+    server
+        .store
+        .create_user("bea", "b@example.org", "Bea", &hash)
+        .unwrap();
+    server.store.add_member(&project, "bea", "editor").unwrap();
+    let (_, cookie) = log_in_as(base, "b@example.org").await;
+
+    let mut b = Peer::connect(base, &cookie, &project, 22).await;
+    server.store.remove_member(&project, "bea").unwrap();
+    assert_eq!(closed_with(&mut b.ws).await, 4004);
+
+    server.store.add_member(&project, "bea", "editor").unwrap();
+    let mut b = Peer::connect(base, &cookie, &project, 23).await;
+    server.store.delete_user("bea").unwrap();
+    assert_eq!(closed_with(&mut b.ws).await, 4401);
+    for _ in 0..50 {
+        if server.store.grants().is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("a grant outlived its socket");
+}
+
+/// A session that expires while its socket is open closes it with 4401.
+#[tokio::test]
+async fn an_expiring_session_closes_its_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = InProcess::start(dir.path()).await;
+    let base = &server.base;
+    let (owner, _) = sign_up(base).await;
+    let project = new_project(&owner, base).await;
+    let user = server.user_id("a@example.org");
+    server
+        .store
+        .create_session("short-lived", &user, 2)
+        .unwrap();
+    let mut a = Peer::connect(base, "nisaba_session=short-lived", &project, 11).await;
+    let started = std::time::Instant::now();
+    assert_eq!(closed_with(&mut a.ws).await, 4401);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// `len` letters that do not compress.
+fn noise(len: usize, seed: u64) -> String {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b'a' + u8::try_from(x % 26).unwrap())
+        })
+        .collect()
+}
+
+/// The reviewer's case: 6 MiB of edits made offline go up in parts, are
+/// saved, and come down in parts to a client that joins later.
+#[tokio::test]
+async fn a_6_mib_backlog_is_saved_and_reaches_a_new_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    let (client, cookie) = sign_up(base).await;
+    let project = new_project(&client, base).await;
+    let mut a = Peer::connect(base, &cookie, &project, 11).await;
+    let big = noise(6 << 20, 7);
+    a.type_text(&big).await;
+    a.saved().await;
+    let b = Peer::connect(base, &cookie, &project, 22).await;
+    assert!(b.main_text().to_string().ends_with(&big));
+    assert!(main_text(&client, base, &project).await.ends_with(&big));
+}
+
+/// A Begin that declares more than the project has left is refused with
+/// 4130 before any part is sent.
+#[tokio::test]
+async fn a_declared_length_over_the_quota_is_refused_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    let (client, cookie) = sign_up(base).await;
+    let project = new_project(&client, base).await;
+    let mut a = Peer::connect(base, &cookie, &project, 11).await;
+    send(&mut a.ws, &Frame::Begin { total: 33 << 20 }).await;
+    assert_eq!(closed_with(&mut a.ws).await, 4130);
+}
+
+/// Parts missing, repeated, out of order or longer than declared close the
+/// socket with 4000, and nothing of the update is applied.
+#[tokio::test]
+async fn parts_in_the_wrong_order_are_refused_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    let (client, cookie) = sign_up(base).await;
+    let project = new_project(&client, base).await;
+    let peer = Peer::connect(base, &cookie, &project, 11).await;
+    let text = peer.main_text();
+    let marker = "Sea stars";
+    text.insert(
+        text.len_unicode(),
+        &format!("{marker}{}", noise(3 << 20, 3)),
+    )
+    .unwrap();
+    peer.doc.commit();
+    let update = peer.doc.export(ExportMode::all_updates()).unwrap();
+    let messages = split(&Frame::Update(update), PART);
+    assert_eq!(messages.len(), 5, "a Begin and four parts");
+    let (begin, parts) = (&messages[0], &messages[1..]);
+    let longer = {
+        let Frame::Part { bytes, .. } = Frame::decode(&parts[3], PART).unwrap() else {
+            unreachable!()
+        };
+        let mut bytes = bytes;
+        bytes.push(0);
+        Frame::Part { index: 3, bytes }.encode()
+    };
+    let cases: [(&str, Vec<&[u8]>); 4] = [
+        ("missing", vec![&parts[0], &parts[2]]),
+        ("repeated", vec![&parts[0], &parts[0]]),
+        ("out of order", vec![&parts[1]]),
+        (
+            "longer than declared",
+            vec![&parts[0], &parts[1], &parts[2], &longer],
+        ),
+    ];
+    for (name, sent) in cases {
+        let mut ws = Peer::connect(base, &cookie, &project, 12).await.ws;
+        ws.send(Message::Binary(begin.clone().into()))
+            .await
+            .unwrap();
+        for m in sent {
+            ws.send(Message::Binary(m.to_vec().into())).await.unwrap();
+        }
+        assert_eq!(closed_with(&mut ws).await, 4000, "{name}");
+    }
+    let text = main_text(&client, base, &project).await;
+    assert!(
+        !text.contains(marker),
+        "part of a refused update was applied"
+    );
+}
+
+/// Two sockets send large updates whose parts interleave on the server.
+#[tokio::test]
+async fn two_large_updates_interleave() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    let (client, cookie) = sign_up(base).await;
+    let project = new_project(&client, base).await;
+    let mut a = Peer::connect(base, &cookie, &project, 11).await;
+    let mut b = Peer::connect(base, &cookie, &project, 22).await;
+    let mut messages = Vec::new();
+    for (peer, seed) in [(&a, 1), (&b, 2)] {
+        let text = peer.main_text();
+        text.insert(text.len_unicode(), &noise(3 << 20, seed))
+            .unwrap();
+        peer.doc.commit();
+        let update = peer.doc.export(ExportMode::updates(&peer.acked)).unwrap();
+        messages.push(split(&Frame::Update(update), PART));
+    }
+    let [from_b, from_a] = [messages.pop().unwrap(), messages.pop().unwrap()];
+    assert!(from_a.len() > 2 && from_b.len() > 2);
+    for i in 0..from_a.len().max(from_b.len()) {
+        if let Some(m) = from_a.get(i) {
+            a.ws.send(Message::Binary(m.clone().into())).await.unwrap();
+        }
+        if let Some(m) = from_b.get(i) {
+            b.ws.send(Message::Binary(m.clone().into())).await.unwrap();
+        }
+    }
+    a.saved().await;
+    b.saved().await;
+    let text = main_text(&client, base, &project).await;
+    assert!(text.contains(&noise(3 << 20, 1)));
+    assert!(text.contains(&noise(3 << 20, 2)));
+}
+
+/// A socket that drops in the middle of an update leaves nothing of it.
+/// The client sends it again after it reconnects, and it is saved once.
+#[tokio::test]
+async fn an_update_cut_off_midway_is_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    let (client, cookie) = sign_up(base).await;
+    let project = new_project(&client, base).await;
+    let mut a = Peer::connect(base, &cookie, &project, 11).await;
+    let big = noise(3 << 20, 5);
+    let text = a.main_text();
+    text.insert(text.len_unicode(), &big).unwrap();
+    a.doc.commit();
+    let update = a.doc.export(ExportMode::updates(&a.acked)).unwrap();
+    let messages = split(&Frame::Update(update), PART);
+    for m in &messages[..3] {
+        a.ws.send(Message::Binary(m.clone().into())).await.unwrap();
+    }
+    a.ws.close(None).await.unwrap();
+    drop(a.ws);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!main_text(&client, base, &project).await.contains(&big));
+
+    let mut again = Peer::connect(base, &cookie, &project, 12).await;
+    again
+        .doc
+        .import(&a.doc.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    again.push_saved().await;
+    let saved = main_text(&client, base, &project).await;
+    assert_eq!(saved.matches(&big).count(), 1);
+}
+
+/// Once an owner exists, setup answers 409 and computes no hash. A wrong
+/// code answers 403 the same way.
+#[tokio::test]
+async fn setup_after_the_owner_does_no_password_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = InProcess::start(dir.path()).await;
+    let base = &server.base;
+    sign_up(base).await;
+    let before = server.app.passwords().computed();
+    assert_eq!(before, 1, "the owner's hash");
+    for _ in 0..5 {
+        let res = browser(base)
+            .post(format!("{base}/api/setup"))
+            .json(&serde_json::json!({"email": "b@example.org", "password": PASSWORD}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 409);
+    }
+    assert_eq!(server.app.passwords().computed(), before);
+}
+
+async fn try_log_in(base: &str, email: &str, password: &str) -> reqwest::Response {
+    try_log_in_with(&browser(base), base, email, password).await
+}
+
+async fn try_log_in_with(
+    client: &reqwest::Client,
+    base: &str,
+    email: &str,
+    password: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"email": email, "password": password}))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// After three wrong passwords for one email the next try, even with the
+/// right password, waits; another email does not.
+#[tokio::test]
+async fn failed_sign_ins_slow_that_email() {
+    let dir = tempfile::tempdir().unwrap();
+    accounts(dir.path(), &["a@example.org", "b@example.org"]);
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    for _ in 0..3 {
+        assert_eq!(
+            try_log_in(base, "a@example.org", "wrong").await.status(),
+            401
+        );
+    }
+    let res = try_log_in(base, "a@example.org", PASSWORD).await;
+    assert_eq!(res.status(), 429);
+    let wait: u64 = res.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=2).contains(&wait), "{wait}");
+    assert_eq!(
+        try_log_in(base, "b@example.org", PASSWORD).await.status(),
+        200
+    );
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    assert_eq!(
+        try_log_in(base, "a@example.org", PASSWORD).await.status(),
+        200
+    );
+    assert_eq!(
+        try_log_in(base, "a@example.org", "wrong").await.status(),
+        401,
+        "a sign-in that works starts over"
+    );
+}
+
+/// More sign-ins at once than the workers and the queue hold: the rest are
+/// answered 503 with Retry-After at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_password_queue_answers_503() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    // One client, so the requests leave at once.
+    let client = browser(&server.base);
+    let tries: Vec<_> = (0..80)
+        .map(|i| {
+            let (client, base) = (client.clone(), server.base.clone());
+            tokio::spawn(async move {
+                let res =
+                    try_log_in_with(&client, &base, &format!("n{i}@example.org"), "wrong").await;
+                let after = res
+                    .headers()
+                    .get("retry-after")
+                    .map(|v| v.to_str().unwrap().to_owned());
+                (res.status().as_u16(), after)
+            })
+        })
+        .collect();
+    let mut busy = 0;
+    for t in tries {
+        match t.await.unwrap() {
+            (401, None) => {}
+            (503, Some(after)) => {
+                assert_eq!(after, "1");
+                busy += 1;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(busy > 0, "no request was refused");
+    assert!(busy <= 80 - 20, "{busy} refused; 20 fit");
+}
+
+/// On a system that cannot sandbox exports, an export is refused with a
+/// clear error unless the server allows it.
+#[tokio::test]
+async fn an_unsandboxed_export_is_refused_unless_allowed() {
+    use nisaba_server::config::ExportLimits;
+    use nisaba_server::export::{Exporter, Sandbox};
+    let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nisaba"));
+    let none = || Sandbox::None("no Landlock in this test".into());
+    let dir = tempfile::tempdir().unwrap();
+    let server = InProcess::start_with(
+        dir.path(),
+        Exporter::with_sandbox(exe.clone(), ExportLimits::default(), none()),
+    )
+    .await;
+    let (client, _) = sign_up(&server.base).await;
+    let project = new_project(&client, &server.base).await;
+    let res = export(&client, &server.base, &project).await;
+    assert_eq!(res.status(), 503);
+    let message = res.text().await.unwrap();
+    assert!(message.contains("cannot sandbox"), "{message}");
+    assert!(message.contains("--allow-unsandboxed-export"), "{message}");
+    drop(server);
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ExportLimits {
+        allow_unsandboxed: true,
+        ..ExportLimits::default()
+    };
+    let server =
+        InProcess::start_with(dir.path(), Exporter::with_sandbox(exe, limits, none())).await;
+    let (client, _) = sign_up(&server.base).await;
+    let project = new_project(&client, &server.base).await;
+    assert_eq!(export(&client, &server.base, &project).await.status(), 200);
+}
+
+/// The server says at start whether exports are sandboxed.
+#[tokio::test]
+async fn the_start_log_says_whether_exports_are_sandboxed() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let lines: Vec<_> = server
+        .start
+        .iter()
+        .filter(|l| l.starts_with("exports are"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{:?}", server.start);
+    let allowed = Server::start_with(
+        tempfile::tempdir().unwrap().path(),
+        &["--allow-unsandboxed-export"],
+    );
+    assert!(allowed.start.iter().any(|l| l.starts_with("exports are")));
+}
+
+/// The children of `pid` and their states, zombies included.
+#[cfg(target_os = "linux")]
+fn children(pid: u32) -> Vec<(u32, char)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(child) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{child}/stat")) else {
+            continue;
+        };
+        // pid (comm) state ppid ...
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().and_then(|s| s.chars().next()).unwrap_or('?');
+        if fields.next().and_then(|p| p.parse::<u32>().ok()) == Some(pid) {
+            out.push((child, state));
+        }
+    }
+    out
+}
+
+/// Whether `pid` exists at all, as a zombie too.
+#[cfg(target_os = "linux")]
+fn exists(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Waits up to `secs` for `check`.
+async fn within(secs: u64, mut check: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + Duration::from_secs(secs);
+    while std::time::Instant::now() < end {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    check()
+}
+
+const ENDLESS: &str = "#for a in range(100000) { for b in range(100000) { } }";
+
+/// Starts an export of a document that runs past any deadline here and
+/// returns the task and the export child's pid.
+#[cfg(target_os = "linux")]
+async fn endless_export(server: &Server) -> (tokio::task::JoinHandle<()>, u32) {
+    let base = &server.base;
+    let (client, _) = sign_up(base).await;
+    let endless = project_of(&client, base, ENDLESS).await;
+    let task = tokio::spawn({
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let _ = export(&client, &base, &endless).await;
+        }
+    });
+    let pid = server.child.id();
+    let mut child = None;
+    assert!(
+        within(10, || {
+            child = children(pid).first().map(|c| c.0);
+            child.is_some()
+        })
+        .await,
+        "no export child started"
+    );
+    (task, child.unwrap())
+}
+
+/// A client that leaves in the middle of an export ends the child: it is
+/// killed and reaped long before the 60 s deadline.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_client_that_leaves_mid_export_ends_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let (task, child) = endless_export(&server).await;
+    task.abort();
+    let _ = task.await;
+    assert!(
+        within(5, || !exists(child)).await,
+        "the child is still there"
+    );
+    assert_eq!(children(server.child.id()), vec![]);
+}
+
+/// SIGTERM stops the server within the grace time, and the export child
+/// goes with it: no zombie, no orphan.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stopping_the_server_ends_the_export_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Server::start(dir.path());
+    let (task, child) = endless_export(&server).await;
+    let status = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut exited = None;
+    assert!(
+        within(10, || {
+            exited = server.child.try_wait().unwrap();
+            exited.is_some()
+        })
+        .await,
+        "the server did not stop"
+    );
+    assert!(exited.unwrap().success(), "{exited:?}");
+    assert!(
+        within(5, || !exists(child)).await,
+        "the export child outlived the server"
+    );
+    task.abort();
+}
+
+/// SIGKILL of the server leaves no export child behind either.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn killing_the_server_ends_the_export_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let (task, child) = endless_export(&server).await;
+    server.kill9();
+    assert!(
+        within(5, || !exists(child)).await,
+        "the export child outlived the server"
+    );
+    task.abort();
 }

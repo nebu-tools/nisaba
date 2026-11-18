@@ -9,7 +9,7 @@
 //! the caller is a member of project `id`, and an asset is served or
 //! exported only when that project holds it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,21 +24,22 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use nisaba_compile_core::FileContents;
-use nisaba_sync::{Limits, Role, close};
+use nisaba_sync::close;
 use serde::Deserialize;
 
 use crate::api::{AssetAdded, Created, Credentials, NewProject, Session, SetupRequest, User};
 use crate::config::PublicAddress;
 use crate::export::{ExportError, Exporter};
+use crate::passwords::{Busy, Passwords};
 use crate::project::{self, NewFile};
 use crate::store::{Setup, Store};
 use crate::sync::Rooms;
 
 const SESSION_TTL: i64 = 30 * 24 * 3600;
-/// Sign-in attempts per account per minute.
-const SIGN_IN_PER_MINUTE: usize = 10;
 /// Password hashes computed at once. Each takes about 19 MiB and a core.
 const PASSWORD_WORKERS: usize = 4;
+/// Password requests that may wait for a worker.
+const PASSWORD_QUEUE: usize = 16;
 /// Open sync sockets per account.
 const SOCKETS_PER_ACCOUNT: usize = 32;
 /// Request bodies: most routes, an asset upload, a project import.
@@ -53,8 +54,7 @@ pub struct App {
     rooms: Rooms,
     public: Arc<PublicAddress>,
     exporter: Exporter,
-    passwords: Arc<tokio::sync::Semaphore>,
-    attempts: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    passwords: Arc<Passwords>,
     sockets: Arc<Mutex<HashMap<String, usize>>>,
 }
 
@@ -66,8 +66,7 @@ impl App {
             store,
             public: Arc::new(public),
             exporter,
-            passwords: Arc::new(tokio::sync::Semaphore::new(PASSWORD_WORKERS)),
-            attempts: Arc::default(),
+            passwords: Arc::new(Passwords::new(PASSWORD_WORKERS, PASSWORD_QUEUE)),
             sockets: Arc::default(),
         }
     }
@@ -77,34 +76,10 @@ impl App {
         &self.rooms
     }
 
-    /// Records a sign-in attempt for `key` and says whether it is within the
-    /// limit of the last minute.
-    fn attempt(&self, key: &str) -> bool {
-        let now = Instant::now();
-        let minute = Duration::from_secs(60);
-        let mut attempts = self.attempts.lock().expect("attempts lock");
-        if attempts.len() > 10_000 {
-            attempts.retain(|_, times| times.back().is_some_and(|t| now - *t < minute));
-        }
-        let times = attempts.entry(key.to_owned()).or_default();
-        while times.front().is_some_and(|t| now - *t >= minute) {
-            times.pop_front();
-        }
-        if times.len() >= SIGN_IN_PER_MINUTE {
-            return false;
-        }
-        times.push_back(now);
-        true
-    }
-
-    /// Runs a password hash or check on a blocking thread, at most
-    /// [`PASSWORD_WORKERS`] at a time.
-    async fn password_work<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<T, (StatusCode, String)> {
-        let _permit = self.passwords.acquire().await.map_err(internal)?;
-        tokio::task::spawn_blocking(work).await.map_err(internal)
+    /// The password work and sign-in limits.
+    #[must_use]
+    pub fn passwords(&self) -> &Passwords {
+        &self.passwords
     }
 }
 
@@ -155,9 +130,9 @@ fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
 /// size limit, 500 otherwise.
 fn refused_update(e: nisaba_sync::SyncError) -> (StatusCode, String) {
     match e {
-        nisaba_sync::SyncError::TooLarge(_) => fail(
+        nisaba_sync::SyncError::TooLarge(_) | nisaba_sync::SyncError::ProjectFull { .. } => fail(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "the project is at its size limit",
+            "the project is at its size limit for text and history",
         ),
         e => internal(e),
     }
@@ -283,15 +258,55 @@ async fn session(State(app): State<App>, headers: HeaderMap) -> ApiResult {
     .into_response())
 }
 
+/// A refusal that tells the client when to try again.
+fn try_later(status: StatusCode, wait: Duration, msg: &str) -> Response {
+    let secs = wait.as_secs_f64().ceil().max(1.0);
+    (
+        status,
+        [(header::RETRY_AFTER, format!("{secs:.0}"))],
+        msg.to_owned(),
+    )
+        .into_response()
+}
+
+fn busy(Busy: Busy) -> Response {
+    try_later(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Duration::from_secs(1),
+        "the server is busy; try again in a moment",
+    )
+}
+
+fn setup_refusal(setup: &Setup) -> (StatusCode, String) {
+    match setup {
+        Setup::Created => internal("setup worked"),
+        Setup::Taken => fail(StatusCode::CONFLICT, "this server already has an owner"),
+        Setup::WrongCode => fail(
+            StatusCode::FORBIDDEN,
+            "wrong setup code; the server printed it to its log when it started",
+        ),
+    }
+}
+
+/// First-run setup. The owner and the code are checked before the password
+/// is hashed, so a server that has an owner does no password work here, and
+/// checked again in the transaction that creates the account.
 async fn setup(State(app): State<App>, axum::Json(body): axum::Json<SetupRequest>) -> ApiResult {
+    if let Some(refused) = app
+        .store
+        .setup_refused(body.setup_code.as_deref())
+        .map_err(internal)?
+    {
+        return Err(setup_refusal(&refused));
+    }
     if body.password.len() < 8 {
         return Err(fail(StatusCode::BAD_REQUEST, "use at least 8 characters"));
     }
     let password = body.password.clone();
-    let hash = app
-        .password_work(move || hash_password(&password))
-        .await?
-        .map_err(internal)?;
+    let hash = match app.passwords.run(move || hash_password(&password)).await {
+        Ok(hash) => hash.map_err(internal)?,
+        Err(b) => return Ok(busy(b)),
+    };
     let email = body.email.trim().to_lowercase();
     let user = User {
         id: format!("{:016x}", rand::random::<u64>()),
@@ -308,24 +323,19 @@ async fn setup(State(app): State<App>, axum::Json(body): axum::Json<SetupRequest
         .map_err(internal)?
     {
         Setup::Created => new_session(&app, &user),
-        Setup::Taken => Err(fail(
-            StatusCode::CONFLICT,
-            "this server already has an owner",
-        )),
-        Setup::WrongCode => Err(fail(
-            StatusCode::FORBIDDEN,
-            "wrong setup code; the server printed it to its log when it started",
-        )),
+        refused => Err(setup_refusal(&refused)),
     }
 }
 
+/// Sign-in. An email that failed too often is refused with 429 before any
+/// password work; see [`crate::passwords`].
 async fn login(State(app): State<App>, axum::Json(body): axum::Json<Credentials>) -> ApiResult {
-    let wrong = || fail(StatusCode::UNAUTHORIZED, "wrong email or password");
     let email = body.email.trim().to_lowercase();
-    if !app.attempt(&format!("login:{email}")) {
-        return Err(fail(
+    if let Err(wait) = app.passwords.check(&email, Instant::now()) {
+        return Ok(try_later(
             StatusCode::TOO_MANY_REQUESTS,
-            "too many sign-in attempts for this account; wait a minute",
+            wait,
+            "too many failed sign-ins for this email; wait and try again",
         ));
     }
     let found = app.store.user_by_email(&email).map_err(internal)?;
@@ -334,17 +344,25 @@ async fn login(State(app): State<App>, axum::Json(body): axum::Json<Credentials>
         .map_or_else(|| DUMMY_HASH.clone(), |(_, hash)| hash.clone());
     let password = body.password;
     let matches = app
-        .password_work(move || {
+        .passwords
+        .run(move || {
             PasswordHash::new(&hash).is_ok_and(|parsed| {
                 argon2::Argon2::default()
                     .verify_password(password.as_bytes(), &parsed)
                     .is_ok()
             })
         })
-        .await?;
-    match found {
-        Some((user, _)) if matches => new_session(&app, &user),
-        _ => Err(wrong()),
+        .await;
+    match (found, matches) {
+        (_, Err(b)) => Ok(busy(b)),
+        (Some((user, _)), Ok(true)) => {
+            app.passwords.succeeded(&email);
+            new_session(&app, &user)
+        }
+        _ => {
+            app.passwords.failed(&email, Instant::now());
+            Err(fail(StatusCode::UNAUTHORIZED, "wrong email or password"))
+        }
     }
 }
 
@@ -520,6 +538,9 @@ async fn export_pdf(
             )
                 .into_response());
         }
+        Err(e @ (ExportError::Unsandboxed(_) | ExportError::Stopping)) => {
+            return Err(fail(StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
+        }
         Err(e @ ExportError::Failed(_)) => {
             tracing::warn!(project = %id, error = %e, "export failed");
             return Err(internal(e));
@@ -534,7 +555,9 @@ async fn export_pdf(
 /// handshake from this server's pages is upgraded even when the caller may
 /// not open the project, and the socket is then closed with a code the
 /// client acts on: signed out (4401), no such project (4004) or too many
-/// sockets (4029).
+/// sockets (4029). The socket holds a grant from the session; it closes with
+/// 4401 when the session ends or expires and 4004 when the membership goes,
+/// and no frame after that is applied (`access.rs`).
 async fn sync_upgrade(
     State(app): State<App>,
     headers: HeaderMap,
@@ -544,33 +567,29 @@ async fn sync_upgrade(
     if !app.public.same_origin(&headers) {
         return Err(fail(StatusCode::FORBIDDEN, "cross-origin socket refused"));
     }
-    let max = Limits::default().max_update + 1024;
+    // A message is at most one part and its header.
+    let max = nisaba_sync::PART + 64;
     let ws = ws.max_message_size(max).max_frame_size(max);
-    let (user, role) = match member(&app, &headers, &id) {
-        Ok(found) => found,
-        Err((StatusCode::UNAUTHORIZED, _)) => {
-            return Ok(refuse_socket(ws, close::SIGNED_OUT, "sign in again"));
-        }
-        Err((StatusCode::NOT_FOUND, _)) => {
-            return Ok(refuse_socket(ws, close::NOT_FOUND, "no such project"));
-        }
-        Err(e) => return Err(e),
+    let Some(token) = token(&app, &headers) else {
+        return Ok(refuse_socket(ws, close::SIGNED_OUT, "sign in again"));
     };
-    let Some(slot) = SocketSlot::take(&app, &user.id) else {
+    let grant = match app.store.grant(&token, &id).map_err(internal)? {
+        Ok(grant) => grant,
+        Err(code) if code == close::NOT_FOUND => {
+            return Ok(refuse_socket(ws, code, "no such project"));
+        }
+        Err(code) => return Ok(refuse_socket(ws, code, "sign in again")),
+    };
+    let Some(slot) = SocketSlot::take(&app, &grant.user.id) else {
         return Ok(refuse_socket(
             ws,
             close::FULL,
             "too many open connections for this account",
         ));
     };
-    let role = match role.as_str() {
-        "owner" | "editor" => Role::Editor,
-        "commenter" => Role::Commenter,
-        _ => Role::Viewer,
-    };
     let rooms = app.rooms.clone();
     Ok(ws.on_upgrade(move |socket| async move {
-        crate::sync::run(socket, rooms, id, role).await;
+        crate::sync::run(socket, rooms, id, grant).await;
         drop(slot);
     }))
 }
@@ -585,4 +604,17 @@ fn refuse_socket(ws: WebSocketUpgrade, code: u16, reason: &'static str) -> Respo
             })))
             .await;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_project_refuses_an_upload_with_413() {
+        let full = nisaba_sync::SyncError::ProjectFull { need: 10, left: 1 };
+        assert_eq!(refused_update(full).0, StatusCode::PAYLOAD_TOO_LARGE);
+        let big = nisaba_sync::SyncError::TooLarge(10);
+        assert_eq!(refused_update(big).0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }

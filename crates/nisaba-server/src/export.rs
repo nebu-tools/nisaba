@@ -7,10 +7,22 @@
 //! standard output.
 //!
 //! On Linux the child limits its address space (`RLIMIT_AS`) and its CPU time
-//! (`RLIMIT_CPU`), reads every font into memory, and then gives up all file
-//! system access and TCP with Landlock, best effort on the running kernel. On
-//! every system the server kills the child at the deadline, runs at most
-//! `parallel` children at once, and lets at most `queue` more requests wait.
+//! (`RLIMIT_CPU`), asks to be killed when the server dies, reads every font
+//! into memory, and then gives up all file system access and TCP with
+//! Landlock. On every system the server kills the child at the deadline, runs
+//! at most `parallel` children at once, and lets at most `queue` more
+//! requests wait.
+//!
+//! The sandbox fails closed. The server checks at start whether this system
+//! can enforce it ([`probe`]). If it cannot, every export is refused with
+//! [`ExportError::Unsandboxed`] unless the server was started with
+//! `--allow-unsandboxed-export`. The child checks again and stops when the
+//! sandbox it was told to require is not there.
+//!
+//! A child never outlives its request. It is killed and reaped when the
+//! deadline passes, when the request is dropped because the client went
+//! away, and when the server stops ([`Exporter::stop`]). If the server itself
+//! is killed, the kernel kills the child (`PR_SET_PDEATHSIG`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,6 +42,9 @@ pub const SUBCOMMAND: &str = "__export";
 const EXIT_COMPILE: i32 = 2;
 /// Exit status of a child that could not set up its limits or read its input.
 const EXIT_SETUP: i32 = 3;
+/// Exit status of a child that was told to require the sandbox and could not
+/// enforce it.
+const EXIT_UNSANDBOXED: i32 = 4;
 
 const MAGIC: &[u8; 8] = b"nisaba1\n";
 /// Error output kept from a child.
@@ -48,6 +63,11 @@ pub enum ExportError {
     OutOfTime {
         seconds: u64,
     },
+    /// This system cannot sandbox an export, and the server was not started
+    /// with `--allow-unsandboxed-export`.
+    Unsandboxed(String),
+    /// The server is stopping.
+    Stopping,
     /// Anything else, such as a child that could not start.
     Failed(String),
 }
@@ -68,9 +88,45 @@ impl std::fmt::Display for ExportError {
                 f,
                 "the export ran out of time: the document took longer than {seconds} seconds"
             ),
+            Self::Unsandboxed(why) => write!(
+                f,
+                "exports are turned off on this server: it cannot sandbox them ({why}). \
+                 The server admin can start it with --allow-unsandboxed-export to allow them"
+            ),
+            Self::Stopping => write!(f, "the server is stopping; try again in a minute"),
             Self::Failed(message) => write!(f, "the export failed: {message}"),
         }
     }
+}
+
+/// How much of the sandbox this system enforces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Sandbox {
+    /// Every rule.
+    Full,
+    /// The file system rules, but not every rule this build asks for, as on
+    /// a kernel without Landlock network rules.
+    Partial,
+    /// None, and why.
+    None(String),
+}
+
+impl Sandbox {
+    fn enforced(&self) -> bool {
+        !matches!(self, Self::None(_))
+    }
+}
+
+/// Whether this system can enforce the export sandbox. Tries it on a thread
+/// that ends at once; Landlock restricts only the thread that asks.
+#[must_use]
+pub fn probe() -> Sandbox {
+    std::thread::spawn(|| match sandbox() {
+        Ok(s) => s,
+        Err(e) => Sandbox::None(e),
+    })
+    .join()
+    .unwrap_or_else(|_| Sandbox::None("the check panicked".into()))
 }
 
 /// Runs exports in child processes within the limits.
@@ -78,20 +134,55 @@ impl std::fmt::Display for ExportError {
 pub struct Exporter {
     exe: Arc<PathBuf>,
     limits: ExportLimits,
+    sandbox: Sandbox,
     slots: Arc<tokio::sync::Semaphore>,
     waiting: Arc<AtomicUsize>,
+    stopping: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Exporter {
-    /// `exe` is the server binary, which the children run.
+    /// `exe` is the server binary, which the children run. Checks the
+    /// sandbox with [`probe`].
     #[must_use]
     pub fn new(exe: PathBuf, limits: ExportLimits) -> Self {
+        Self::with_sandbox(exe, limits, probe())
+    }
+
+    /// As [`Exporter::new`], with the sandbox as given. For tests of a
+    /// system without one.
+    #[must_use]
+    pub fn with_sandbox(exe: PathBuf, limits: ExportLimits, sandbox: Sandbox) -> Self {
         Self {
             exe: Arc::new(exe),
             slots: Arc::new(tokio::sync::Semaphore::new(limits.parallel)),
             waiting: Arc::default(),
+            stopping: Arc::new(tokio::sync::watch::Sender::new(false)),
+            sandbox,
             limits,
         }
+    }
+
+    /// The line the server logs at start.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match (&self.sandbox, self.limits.allow_unsandboxed) {
+            (Sandbox::Full, _) => "exports are sandboxed with Landlock".into(),
+            (Sandbox::Partial, _) => "exports are sandboxed with Landlock, without the rules \
+                 this kernel lacks; the file system rules hold"
+                .into(),
+            (Sandbox::None(why), false) => format!(
+                "exports are turned off: this system cannot sandbox them ({why}); \
+                 start with --allow-unsandboxed-export to allow them"
+            ),
+            (Sandbox::None(why), true) => {
+                format!("exports are NOT sandboxed ({why}); allowed by --allow-unsandboxed-export")
+            }
+        }
+    }
+
+    /// Kills every running child and refuses new exports. For shutdown.
+    pub fn stop(&self) {
+        self.stopping.send_replace(true);
     }
 
     /// The binary of this process, even after it was replaced on disk.
@@ -106,6 +197,27 @@ impl Exporter {
 
     /// Compiles `files` to a PDF dated `today` in a child process.
     pub async fn pdf(
+        &self,
+        files: Vec<(String, FileContents)>,
+        today: Date,
+    ) -> Result<Vec<u8>, ExportError> {
+        if !self.sandbox.enforced() && !self.limits.allow_unsandboxed {
+            let Sandbox::None(why) = &self.sandbox else {
+                unreachable!()
+            };
+            return Err(ExportError::Unsandboxed(why.clone()));
+        }
+        let mut stopping = self.stopping.subscribe();
+        if *stopping.borrow_and_update() {
+            return Err(ExportError::Stopping);
+        }
+        tokio::select! {
+            result = self.queue_and_run(files, today) => result,
+            _ = stopping.changed() => Err(ExportError::Stopping),
+        }
+    }
+
+    async fn queue_and_run(
         &self,
         files: Vec<(String, FileContents)>,
         today: Date,
@@ -127,10 +239,17 @@ impl Exporter {
 
     async fn run_child(&self, input: &[u8]) -> Result<Vec<u8>, ExportError> {
         let failed = |e: std::io::Error| ExportError::Failed(e.to_string());
-        let mut child = tokio::process::Command::new(&*self.exe)
+        let sandbox = if self.sandbox.enforced() {
+            "required"
+        } else {
+            "optional"
+        };
+        let child = tokio::process::Command::new(&*self.exe)
             .arg(SUBCOMMAND)
             .arg(self.limits.memory_mb.to_string())
             .arg(self.limits.seconds.to_string())
+            .arg(sandbox)
+            .arg(std::process::id().to_string())
             .env_clear()
             // Fewer malloc arenas and threads keep the address space small.
             .env("MALLOC_ARENA_MAX", "2")
@@ -142,6 +261,8 @@ impl Exporter {
             .kill_on_drop(true)
             .spawn()
             .map_err(failed)?;
+        let mut child = Reaped(Some(child));
+        let child = child.0.as_mut().expect("just spawned");
         let mut stdin = child.stdin.take().expect("piped stdin");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
@@ -166,7 +287,9 @@ impl Exporter {
         };
         let deadline = Duration::from_secs(self.limits.seconds);
         let Ok(finished) = tokio::time::timeout(deadline, work).await else {
-            // Dropping the child kills it.
+            // Kills and reaps it; so does dropping it if this future is
+            // dropped first.
+            let _ = child.kill().await;
             return Err(ExportError::OutOfTime {
                 seconds: self.limits.seconds,
             });
@@ -189,6 +312,9 @@ impl Exporter {
         if status.code() == Some(EXIT_COMPILE) {
             return ExportError::Compile(errors);
         }
+        if status.code() == Some(EXIT_UNSANDBOXED) {
+            return ExportError::Unsandboxed(errors);
+        }
         // Rust aborts when an allocation fails.
         if errors.contains("memory allocation of") || errors.contains("capacity overflow") {
             return out_of_memory;
@@ -210,18 +336,50 @@ impl Exporter {
     }
 }
 
-/// The child: `nisaba __export MEMORY_MB SECONDS`. Reads one request from
-/// stdin, writes the PDF to stdout and returns the exit status.
+/// Kills and reaps the child when dropped before it was waited for.
+struct Reaped(Option<tokio::process::Child>);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
+/// The child: `nisaba __export MEMORY_MB SECONDS required|optional PARENT`.
+/// Reads one request from stdin, writes the PDF to stdout and returns the
+/// exit status. With `required` it stops when the sandbox cannot be
+/// enforced.
 #[must_use]
 pub fn child_main(args: &[String]) -> i32 {
     use std::io::{Read as _, Write as _};
-    let (Some(memory_mb), Some(seconds)) = (
+    let (Some(memory_mb), Some(seconds), Some(required), Some(parent)) = (
         args.first().and_then(|a| a.parse::<u64>().ok()),
         args.get(1).and_then(|a| a.parse::<u64>().ok()),
+        args.get(2).and_then(|a| match a.as_str() {
+            "required" => Some(true),
+            "optional" => Some(false),
+            _ => None,
+        }),
+        args.get(3).and_then(|a| a.parse::<u32>().ok()),
     ) else {
-        eprintln!("usage: nisaba {SUBCOMMAND} MEMORY_MB SECONDS");
+        eprintln!("usage: nisaba {SUBCOMMAND} MEMORY_MB SECONDS required|optional PARENT_PID");
         return EXIT_SETUP;
     };
+    if let Err(e) = die_with(parent) {
+        eprintln!("cannot tie the export to the server: {e}");
+        return EXIT_SETUP;
+    }
     if let Err(e) = limit(memory_mb, seconds) {
         eprintln!("cannot set the export limits: {e}");
         return EXIT_SETUP;
@@ -238,9 +396,15 @@ pub fn child_main(args: &[String]) -> i32 {
             return EXIT_SETUP;
         }
     };
-    if let Err(e) = sandbox() {
-        eprintln!("cannot restrict the export: {e}");
-        return EXIT_SETUP;
+    let missing = match sandbox() {
+        Ok(Sandbox::None(why)) | Err(why) => Some(why),
+        Ok(Sandbox::Full | Sandbox::Partial) => None,
+    };
+    if let Some(why) = missing
+        && required
+    {
+        eprintln!("{why}");
+        return EXIT_UNSANDBOXED;
     }
     let Some((today, files)) = decode(&input) else {
         eprintln!("the request is malformed");
@@ -283,6 +447,23 @@ fn limit(memory_mb: u64, seconds: u64) -> Result<(), String> {
     set(Resource::Core, 0)
 }
 
+/// Asks the kernel to kill this process when the server ends, then checks
+/// that the server had not already ended.
+#[cfg(target_os = "linux")]
+fn die_with(parent: u32) -> Result<(), String> {
+    use rustix::process::{Signal, getppid, set_parent_process_death_signal};
+    set_parent_process_death_signal(Some(Signal::KILL)).map_err(|e| e.to_string())?;
+    match getppid() {
+        Some(p) if p.as_raw_nonzero().get().cast_unsigned() == parent => Ok(()),
+        _ => Err("the server already ended".into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with(_parent: u32) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn limit(_memory_mb: u64, _seconds: u64) -> Result<(), String> {
     Ok(())
@@ -291,10 +472,10 @@ fn limit(_memory_mb: u64, _seconds: u64) -> Result<(), String> {
 /// Takes away every file system right and TCP bind and connect from this
 /// thread and every thread it starts later, and stops it from signalling
 /// other processes or reaching abstract Unix sockets. Landlock applies what
-/// the running kernel supports and leaves the rest. Returns whether the
-/// kernel enforces any of it.
+/// the running kernel supports and leaves the rest; the result says how much
+/// that was.
 #[cfg(target_os = "linux")]
-pub fn sandbox() -> Result<bool, String> {
+pub fn sandbox() -> Result<Sandbox, String> {
     use landlock::{ABI, Access as _, AccessFs, AccessNet, Ruleset, RulesetAttr as _, Scope};
     let abi = ABI::V6;
     Ruleset::default()
@@ -303,13 +484,19 @@ pub fn sandbox() -> Result<bool, String> {
         .and_then(|r| r.scope(Scope::from_all(abi)))
         .and_then(Ruleset::create)
         .and_then(landlock::RulesetCreated::restrict_self)
-        .map(|status| status.ruleset != landlock::RulesetStatus::NotEnforced)
+        .map(|status| match status.ruleset {
+            landlock::RulesetStatus::FullyEnforced => Sandbox::Full,
+            landlock::RulesetStatus::PartiallyEnforced => Sandbox::Partial,
+            landlock::RulesetStatus::NotEnforced => {
+                Sandbox::None("this kernel has no Landlock, or it is turned off".into())
+            }
+        })
         .map_err(|e| e.to_string())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn sandbox() -> Result<bool, String> {
-    Ok(false)
+pub fn sandbox() -> Result<Sandbox, String> {
+    Ok(Sandbox::None("Landlock exists only on Linux".into()))
 }
 
 /// The request: magic, the date, then each file as a kind byte (0 text,
@@ -392,7 +579,7 @@ mod tests {
         let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         assert!(std::fs::File::open(manifest).is_ok());
         std::thread::spawn(move || {
-            if !sandbox().unwrap() {
+            if !sandbox().unwrap().enforced() {
                 eprintln!("this kernel has no Landlock; nothing to test");
                 return;
             }

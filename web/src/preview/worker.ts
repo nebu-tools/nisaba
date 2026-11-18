@@ -32,6 +32,8 @@ const ready: Promise<JsLiveCompiler> = (async () => {
   return new JsLiveCompiler("main.typ", fonts)
 })()
 let shown: string[] = []
+/** The compile whose layout `shown` is. */
+let shownId = 0
 let queue: ToWorker[] = []
 let running = false
 let broken = false
@@ -55,7 +57,7 @@ async function drain(): Promise<void> {
       let compile: Extract<ToWorker, { type: "compile" }> | undefined
       for (const msg of batch) {
         if (msg.type === "compile") compile = msg
-        else if (msg.type === "render") await render(compiler, msg.index, msg.scale)
+        else if (msg.type === "render") await render(compiler, shownId, msg.index, msg.scale)
         else applyFile(compiler, msg)
       }
       if (compile) await run(compiler, compile)
@@ -81,7 +83,7 @@ async function compileWithFonts(compiler: JsLiveCompiler): Promise<Compiled> {
   }
 }
 
-async function render(compiler: JsLiveCompiler, index: number, scale: number): Promise<void> {
+async function render(compiler: JsLiveCompiler, id: number, index: number, scale: number): Promise<void> {
   const raw = compiler.page_rgba(index, scale)
   if (!raw) return
   const view = new DataView(raw.buffer, raw.byteOffset, 8)
@@ -89,7 +91,7 @@ async function render(compiler: JsLiveCompiler, index: number, scale: number): P
   const height = view.getUint32(4, true)
   const pixels = new Uint8ClampedArray(raw.buffer as ArrayBuffer, raw.byteOffset + 8, width * height * 4)
   const bitmap = await createImageBitmap(new ImageData(pixels, width, height))
-  post({ type: "page", index, bitmap }, [bitmap])
+  post({ type: "page", id, index, bitmap }, [bitmap])
 }
 
 async function run(compiler: JsLiveCompiler, msg: Extract<ToWorker, { type: "compile" }>): Promise<void> {
@@ -98,13 +100,14 @@ async function run(compiler: JsLiveCompiler, msg: Extract<ToWorker, { type: "com
   const compileMs = performance.now() - t0
   const changed = result.pages.flatMap((fp, i) => (fp === shown[i] ? [] : [i]))
   shown = result.pages
+  shownId = msg.id
   post({ type: "layout", id: msg.id, ...result, changed })
   const visible = new Set(msg.visible)
   const t1 = performance.now()
   let rendered = 0
   for (const i of changed) {
     if (visible.has(i) || (visible.size === 0 && i < 3)) {
-      await render(compiler, i, msg.scale)
+      await render(compiler, msg.id, i, msg.scale)
       rendered++
     }
   }

@@ -14,7 +14,7 @@
 //! therefore safe to count as saved.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use loro::{ExportMode, LoroDoc, VersionVector};
@@ -42,7 +42,8 @@ pub struct Peer(u64);
 
 #[derive(Debug, Clone)]
 pub struct Limits {
-    pub max_update: usize,
+    /// The largest Presence frame.
+    pub max_presence: usize,
     pub max_catch_up: usize,
     pub max_peers: usize,
     /// Frames queued for one client before the room drops it as too slow.
@@ -52,15 +53,16 @@ pub struct Limits {
     /// ...or this many log bytes, whichever comes first.
     pub compact_bytes: usize,
     /// The stored size of a project, its snapshot plus its log, past which
-    /// the room refuses updates. Kept below `max_catch_up` so a full project
-    /// still fits in one catch-up.
+    /// the room refuses updates. An update may be as large as what is left.
+    /// Kept below `max_catch_up` so a full project still fits in one
+    /// catch-up. Assets are stored apart and do not count.
     pub max_document: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_update: 4 << 20,
+            max_presence: 64 << 10,
             max_catch_up: 64 << 20,
             max_peers: 64,
             queue: 1024,
@@ -73,7 +75,7 @@ impl Default for Limits {
 
 struct Session {
     role: Role,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::Sender<Arc<Frame>>,
 }
 
 struct State {
@@ -93,6 +95,8 @@ pub struct Room<S> {
     store: Arc<S>,
     limits: Limits,
     write: tokio::sync::Mutex<Log>,
+    /// `snapshot + bytes` of `write`, readable without waiting for it.
+    stored: AtomicUsize,
     state: Mutex<State>,
     next_peer: AtomicU64,
 }
@@ -110,15 +114,17 @@ impl<S: RoomStore> Room<S> {
                 tracing::warn!(project, error = %e, "skipping a log entry that does not import");
             }
         }
+        let log = Log {
+            entries: stored.log.len(),
+            bytes: stored.log.iter().map(Vec::len).sum(),
+            snapshot: stored.snapshot.as_ref().map_or(0, Vec::len),
+        };
         Ok(Self {
             project: project.to_owned(),
             store,
             limits,
-            write: tokio::sync::Mutex::new(Log {
-                entries: stored.log.len(),
-                bytes: stored.log.iter().map(Vec::len).sum(),
-                snapshot: stored.snapshot.as_ref().map_or(0, Vec::len),
-            }),
+            stored: AtomicUsize::new(log.snapshot + log.bytes),
+            write: tokio::sync::Mutex::new(log),
             state: Mutex::new(State {
                 doc,
                 sessions: HashMap::new(),
@@ -130,7 +136,7 @@ impl<S: RoomStore> Room<S> {
     /// Starts a session from the client's Hello. The returned queue starts
     /// with Welcome and then carries every frame for this client. When the
     /// room drops a client as too slow, the queue ends.
-    pub fn join(&self, role: Role, hello: Frame) -> SyncResult<(Peer, mpsc::Receiver<Frame>)> {
+    pub fn join(&self, role: Role, hello: Frame) -> SyncResult<(Peer, mpsc::Receiver<Arc<Frame>>)> {
         let Frame::Hello { protocol, version } = hello else {
             return Err(SyncError::Unexpected);
         };
@@ -159,10 +165,10 @@ impl<S: RoomStore> Room<S> {
             return Err(SyncError::TooLarge(catch_up.len()));
         }
         let (tx, rx) = mpsc::channel(self.limits.queue);
-        tx.try_send(Frame::Welcome {
+        tx.try_send(Arc::new(Frame::Welcome {
             catch_up,
             version: server.encode(),
-        })
+        }))
         .expect("a new queue has room");
         let peer = Peer(self.next_peer.fetch_add(1, Ordering::Relaxed));
         state.sessions.insert(peer, Session { role, tx });
@@ -191,10 +197,10 @@ impl<S: RoomStore> Room<S> {
                 Ok(())
             }
             Frame::Presence(state) => {
-                if state.len() > self.limits.max_update {
+                if state.len() > self.limits.max_presence {
                     return Err(SyncError::TooLarge(state.len()));
                 }
-                let frame = Frame::Presence(state);
+                let frame = Arc::new(Frame::Presence(state));
                 let mut st = self.lock();
                 fan_out(&mut st, &frame, Some(peer));
                 Ok(())
@@ -203,9 +209,11 @@ impl<S: RoomStore> Room<S> {
                 self.send(peer, Frame::Heartbeat);
                 Ok(())
             }
-            Frame::Hello { .. } | Frame::Welcome { .. } | Frame::Ack(_) => {
-                Err(SyncError::Unexpected)
-            }
+            Frame::Hello { .. }
+            | Frame::Welcome { .. }
+            | Frame::Ack(_)
+            | Frame::Begin { .. }
+            | Frame::Part { .. } => Err(SyncError::Unexpected),
         }
     }
 
@@ -224,6 +232,23 @@ impl<S: RoomStore> Room<S> {
         Ok(self.lock().doc.export(ExportMode::Snapshot)?)
     }
 
+    /// How many bytes the project may still grow by.
+    #[must_use]
+    pub fn space(&self) -> usize {
+        self.limits
+            .max_document
+            .saturating_sub(self.stored.load(Ordering::Relaxed))
+    }
+
+    /// Refuses an update of `len` bytes that cannot fit, before it arrives.
+    pub fn fits(&self, len: usize) -> SyncResult<()> {
+        let left = self.space();
+        if len > left {
+            return Err(SyncError::ProjectFull { need: len, left });
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn peers(&self) -> usize {
         self.lock().sessions.len()
@@ -232,9 +257,6 @@ impl<S: RoomStore> Room<S> {
     /// Checks, appends, imports and fans out one update, then compacts if the
     /// log is long. Returns the encoded version vector after the import.
     async fn write_update(&self, update: &[u8], from: Option<Peer>) -> SyncResult<Vec<u8>> {
-        if update.len() > self.limits.max_update {
-            return Err(SyncError::TooLarge(update.len()));
-        }
         let meta = LoroDoc::decode_import_blob_meta(update, true)?;
         // A throwaway import proves the bytes decode before they reach the log.
         LoroDoc::new().import(update)?;
@@ -243,19 +265,27 @@ impl<S: RoomStore> Room<S> {
         if self.lock().doc.oplog_vv().includes_vv(&meta.partial_end_vv) {
             return Ok(self.lock().doc.oplog_vv().encode());
         }
-        let stored = log.snapshot + log.bytes + update.len();
-        if stored > self.limits.max_document {
-            return Err(SyncError::TooLarge(stored));
+        let left = self
+            .limits
+            .max_document
+            .saturating_sub(log.snapshot + log.bytes);
+        if update.len() > left {
+            return Err(SyncError::ProjectFull {
+                need: update.len(),
+                left,
+            });
         }
         let bytes = update.to_vec();
         blocking(&self.store, &self.project, move |s, p| s.append(p, &bytes)).await?;
         log.entries += 1;
         log.bytes += update.len();
+        self.stored
+            .store(log.snapshot + log.bytes, Ordering::Relaxed);
 
         let version = {
             let mut st = self.lock();
             st.doc.import(update)?;
-            fan_out(&mut st, &Frame::Update(update.to_vec()), from);
+            fan_out(&mut st, &Arc::new(Frame::Update(update.to_vec())), from);
             st.doc.oplog_vv().encode()
         };
 
@@ -275,7 +305,8 @@ impl<S: RoomStore> Room<S> {
                         entries: 0,
                         bytes: 0,
                         snapshot: snapshot_len,
-                    }
+                    };
+                    self.stored.store(snapshot_len, Ordering::Relaxed);
                 }
                 // The log still holds everything, so a failed compaction loses
                 // nothing. The next update tries again.
@@ -288,7 +319,7 @@ impl<S: RoomStore> Room<S> {
     fn send(&self, peer: Peer, frame: Frame) {
         let mut st = self.lock();
         if let Some(s) = st.sessions.get(&peer)
-            && s.tx.try_send(frame).is_err()
+            && s.tx.try_send(Arc::new(frame)).is_err()
         {
             st.sessions.remove(&peer);
         }
@@ -303,10 +334,10 @@ impl<S: RoomStore> Room<S> {
 
 /// Queues `frame` for every session but `except`. A session whose queue is
 /// full is dropped; its client sees the queue end and reconnects.
-fn fan_out(state: &mut State, frame: &Frame, except: Option<Peer>) {
+fn fan_out(state: &mut State, frame: &Arc<Frame>, except: Option<Peer>) {
     state
         .sessions
-        .retain(|peer, s| Some(*peer) == except || s.tx.try_send(frame.clone()).is_ok());
+        .retain(|peer, s| Some(*peer) == except || s.tx.try_send(Arc::clone(frame)).is_ok());
 }
 
 async fn blocking<S: RoomStore, T: Send + 'static>(
@@ -347,8 +378,8 @@ mod tests {
         Room::open("p", Arc::clone(store), limits).await.unwrap()
     }
 
-    fn welcome(rx: &mut mpsc::Receiver<Frame>) -> (Vec<u8>, Vec<u8>) {
-        match rx.try_recv().unwrap() {
+    fn welcome(rx: &mut mpsc::Receiver<Arc<Frame>>) -> (Vec<u8>, Vec<u8>) {
+        match Arc::unwrap_or_clone(rx.try_recv().unwrap()) {
             Frame::Welcome { catch_up, version } => (catch_up, version),
             other => panic!("expected Welcome, got {other:?}"),
         }
@@ -370,7 +401,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.load("p").unwrap().log, vec![update.clone()]);
-        let Frame::Ack(vv) = rx_a.try_recv().unwrap() else {
+        let Frame::Ack(vv) = Arc::unwrap_or_clone(rx_a.try_recv().unwrap()) else {
             panic!("expected Ack")
         };
         assert!(
@@ -378,7 +409,7 @@ mod tests {
                 .unwrap()
                 .includes_vv(&doc.oplog_vv())
         );
-        assert_eq!(rx_b.try_recv().unwrap(), Frame::Update(update));
+        assert_eq!(*rx_b.try_recv().unwrap(), Frame::Update(update));
     }
 
     #[tokio::test]
@@ -393,8 +424,8 @@ mod tests {
             .unwrap();
         room.receive(a, Frame::Update(update)).await.unwrap();
         assert_eq!(store.load("p").unwrap().log.len(), 1);
-        assert!(matches!(rx.try_recv().unwrap(), Frame::Ack(_)));
-        assert!(matches!(rx.try_recv().unwrap(), Frame::Ack(_)));
+        assert!(matches!(*rx.try_recv().unwrap(), Frame::Ack(_)));
+        assert!(matches!(*rx.try_recv().unwrap(), Frame::Ack(_)));
     }
 
     #[tokio::test]
@@ -478,7 +509,7 @@ mod tests {
             refused
         };
         assert!(
-            matches!(refused, Some(SyncError::TooLarge(_))),
+            matches!(refused, Some(SyncError::ProjectFull { .. })),
             "{refused:?}"
         );
         // The limit counts what is stored, so it holds after a reopen too.
@@ -551,7 +582,60 @@ mod tests {
         welcome(&mut rx_a);
         welcome(&mut rx_b);
         room.receive(a, Frame::Presence(vec![7])).await.unwrap();
-        assert_eq!(rx_b.try_recv().unwrap(), Frame::Presence(vec![7]));
+        assert_eq!(*rx_b.try_recv().unwrap(), Frame::Presence(vec![7]));
         assert!(rx_a.try_recv().is_err());
+    }
+
+    /// Text that does not compress, so its update is about as long as it.
+    fn noise(len: usize) -> String {
+        let mut seed = 7u32;
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                char::from(b'a' + u8::try_from((seed >> 16) % 26).unwrap())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_update_may_use_all_the_space_left() {
+        let store = Arc::new(MemoryStore::default());
+        let room = room(&store, Limits::default()).await;
+        let (a, mut rx) = room.join(Role::Editor, hello(&[])).unwrap();
+        welcome(&mut rx);
+        let update = edit(&LoroDoc::new(), &noise(6 << 20));
+        assert!(update.len() > 6 << 20);
+        room.fits(update.len()).unwrap();
+        room.receive(a, Frame::Update(update.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(*rx.try_recv().unwrap(), Frame::Ack(_)));
+        assert_eq!(room.space(), (32 << 20) - update.len());
+    }
+
+    #[tokio::test]
+    async fn an_update_larger_than_the_space_left_is_refused_before_it_arrives() {
+        let store = Arc::new(MemoryStore::default());
+        let limits = Limits {
+            max_document: 1 << 20,
+            ..Limits::default()
+        };
+        let room = room(&store, limits).await;
+        room.apply(&edit(&LoroDoc::new(), &noise(600 << 10)))
+            .await
+            .unwrap();
+        let left = room.space();
+        assert!(left < 500 << 10, "{left}");
+        let err = room.fits(left + 1).unwrap_err();
+        assert!(matches!(err, SyncError::ProjectFull { .. }), "{err:?}");
+        assert_eq!(err.close_code(), crate::close::TOO_LARGE);
+        room.fits(left).unwrap();
+        // The room checks again when the update is whole.
+        let err = room
+            .apply(&edit(&LoroDoc::new(), &noise(600 << 10)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SyncError::ProjectFull { .. }), "{err:?}");
+        assert_eq!(store.load("p").unwrap().log.len(), 1);
     }
 }

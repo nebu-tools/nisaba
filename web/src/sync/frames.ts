@@ -1,11 +1,19 @@
 /**
- * Sync protocol version 1: the frame encoding. See DESIGN.md section 4.
+ * Sync protocol version 2: the frame encoding. See DESIGN.md section 4.
  *
  * Each WebSocket binary message is one frame: a type byte and its fields.
  * A blob is a big-endian u32 length and that many bytes.
+ *
+ * No message is longer than PART bytes of payload. A longer frame goes as a
+ * Begin that declares its encoded length, then Parts numbered from 0 whose
+ * bytes are the encoded frame. This is the same code as the server's
+ * `nisaba_sync::protocol`, in both directions.
  */
 
-export const PROTOCOL = 1
+export const PROTOCOL = 2
+
+/** The longest message: 1 MiB. */
+export const PART = 1 << 20
 
 export type Frame =
   | { type: "hello"; protocol: number; version: Uint8Array }
@@ -14,6 +22,8 @@ export type Frame =
   | { type: "ack"; version: Uint8Array }
   | { type: "presence"; state: Uint8Array }
   | { type: "heartbeat" }
+  | { type: "begin"; total: number }
+  | { type: "part"; index: number; bytes: Uint8Array }
 
 const HELLO = 1
 const WELCOME = 2
@@ -21,6 +31,8 @@ const UPDATE = 3
 const ACK = 4
 const PRESENCE = 5
 const HEARTBEAT = 6
+const BEGIN = 7
+const PART_TYPE = 8
 
 /** WebSocket close codes the server sends. */
 export const Close = {
@@ -79,6 +91,18 @@ export function encode(frame: Frame): Uint8Array<ArrayBuffer> {
     case "heartbeat":
       out = new Uint8Array([HEARTBEAT])
       break
+    case "begin":
+      out = new Uint8Array(5)
+      out[0] = BEGIN
+      new DataView(out.buffer).setUint32(1, frame.total)
+      break
+    case "part":
+      out = new Uint8Array(5 + blobs(frame.bytes))
+      out[0] = PART_TYPE
+      new DataView(out.buffer).setUint32(1, frame.index)
+      at = 5
+      put(frame.bytes)
+      break
   }
   return out
 }
@@ -90,6 +114,12 @@ export function decode(buf: Uint8Array): Frame {
   const u8 = (): number => {
     if (at + 1 > buf.length) throw new FrameError("truncated")
     return buf[at++]!
+  }
+  const u32 = (): number => {
+    if (at + 4 > buf.length) throw new FrameError("truncated")
+    const n = view.getUint32(at)
+    at += 4
+    return n
   }
   const blob = (): Uint8Array => {
     if (at + 4 > buf.length) throw new FrameError("truncated")
@@ -120,9 +150,77 @@ export function decode(buf: Uint8Array): Frame {
     case HEARTBEAT:
       frame = { type: "heartbeat" }
       break
+    case BEGIN:
+      frame = { type: "begin", total: u32() }
+      break
+    case PART_TYPE:
+      frame = { type: "part", index: u32(), bytes: blob() }
+      break
     default:
       throw new FrameError(`unknown frame type ${type}`)
   }
   if (at !== buf.length) throw new FrameError(`${buf.length - at} trailing bytes`)
   return frame
+}
+
+/** The messages that carry `frame`: itself when its encoding is at most
+ * `part` bytes, else a Begin and Parts of at most `part` bytes. */
+export function split(frame: Frame, part = PART): Uint8Array<ArrayBuffer>[] {
+  const bytes = encode(frame)
+  if (bytes.length <= part) return [bytes]
+  const out = [encode({ type: "begin", total: bytes.length })]
+  for (let at = 0, index = 0; at < bytes.length; at += part, index++) {
+    out.push(encode({ type: "part", index, bytes: bytes.subarray(at, at + part) }))
+  }
+  return out
+}
+
+/**
+ * Puts frames sent in parts back together, for one connection. The buffer
+ * is the declared length and never grows. Nothing comes out until the last
+ * part, so a frame is used whole or not at all. A part missing, repeated or
+ * out of order, more bytes than declared, a Part without a Begin, or another
+ * frame among the parts is a FrameError, and the frame is dropped.
+ */
+export class Assembler {
+  private open: { buf: Uint8Array; at: number; next: number } | undefined
+
+  constructor(private readonly part = PART) {}
+
+  /** Takes one message; returns the frame it completes. `allow` sees the
+   * declared length of a Begin before any part is kept and may throw. */
+  push(message: Uint8Array, allow: (total: number) => void = () => {}): Frame | undefined {
+    if (message.length > this.part + 9) throw new FrameError("message longer than a part")
+    const frame = decode(message)
+    const open = this.open
+    if (!open) {
+      if (frame.type === "part") throw new FrameError("a Part without a Begin")
+      if (frame.type !== "begin") return frame
+      if (frame.total === 0) throw new FrameError("a Begin of 0 bytes")
+      allow(frame.total)
+      this.open = { buf: new Uint8Array(frame.total), at: 0, next: 0 }
+      return undefined
+    }
+    this.open = undefined
+    if (frame.type !== "part") throw new FrameError("another frame among the parts")
+    if (frame.index !== open.next || frame.bytes.length === 0) {
+      throw new FrameError(`expected part ${open.next}, got ${frame.index}`)
+    }
+    if (open.at + frame.bytes.length > open.buf.length) throw new FrameError("more bytes than the Begin declared")
+    open.buf.set(frame.bytes, open.at)
+    open.at += frame.bytes.length
+    open.next++
+    if (open.at < open.buf.length) {
+      this.open = open
+      return undefined
+    }
+    const whole = decode(open.buf)
+    if (whole.type === "begin" || whole.type === "part") throw new FrameError("parts inside parts")
+    return whole
+  }
+
+  /** Forgets an unfinished frame, as after a reconnect. */
+  reset(): void {
+    this.open = undefined
+  }
 }

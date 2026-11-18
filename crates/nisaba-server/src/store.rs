@@ -19,6 +19,7 @@ use nisaba_sync::{RoomStore, Stored};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+use crate::access::{Grant, Grants};
 use crate::api::{ProjectRow, User};
 
 const SCHEMA: &str = r"
@@ -88,6 +89,8 @@ pub enum Setup {
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
     assets: PathBuf,
+    /// The open sync sockets. Changed only under the `conn` lock.
+    grants: Arc<Grants>,
 }
 
 #[must_use]
@@ -113,6 +116,7 @@ impl Store {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             assets: dir.join("assets"),
+            grants: Arc::default(),
         })
     }
 
@@ -144,29 +148,21 @@ impl Store {
     ) -> Result<Setup, String> {
         self.with(|c| {
             let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let users: i64 = tx.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
-            if users > 0 {
-                return Ok(Setup::Taken);
-            }
-            let stored: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT value FROM settings WHERE key = ?1",
-                    [SETUP_CODE],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(stored) = stored {
-                use subtle::ConstantTimeEq as _;
-                let given = Sha256::digest(normalize_code(code.unwrap_or("")).as_bytes());
-                if !bool::from(given.as_slice().ct_eq(&stored)) {
-                    return Ok(Setup::WrongCode);
-                }
+            if let Some(refused) = setup_refused(&tx, code)? {
+                return Ok(refused);
             }
             insert_user(&tx, &user.id, &user.email, &user.name, password_hash)?;
             tx.execute("DELETE FROM settings WHERE key = ?1", [SETUP_CODE])?;
             tx.commit()?;
             Ok(Setup::Created)
         })
+    }
+
+    /// Says, before any password work, why setup with `code` would fail:
+    /// [`Setup::Taken`] or [`Setup::WrongCode`]. `None` means it may work.
+    /// [`Store::create_owner`] checks again in its transaction.
+    pub fn setup_refused(&self, code: Option<&str>) -> Result<Option<Setup>, String> {
+        self.with(|c| setup_refused(c, code))
     }
 
     /// Prepares first-run setup at start. While no account exists and
@@ -247,11 +243,99 @@ impl Store {
         })
     }
 
+    /// Signs a session out. Its sync sockets close with 4401.
     pub fn delete_session(&self, token: &str) -> Result<(), String> {
         let hash = Sha256::digest(token.as_bytes()).to_vec();
         self.with(|c| {
-            c.execute("DELETE FROM sessions WHERE token_hash = ?1", [hash])
-                .map(drop)
+            c.execute("DELETE FROM sessions WHERE token_hash = ?1", [&hash])?;
+            self.grants.signed_out(&hash);
+            Ok(())
+        })
+    }
+
+    /// Deletes an account with its sessions and memberships. Its sync
+    /// sockets close with 4401.
+    pub fn delete_user(&self, user_id: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
+            self.grants.user_removed(user_id);
+            Ok(())
+        })
+    }
+
+    /// Takes `user_id` out of a project. Their sockets to it close with 4004.
+    pub fn remove_member(&self, project_id: &str, user_id: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM members WHERE project_id = ?1 AND user_id = ?2",
+                params![project_id, user_id],
+            )?;
+            self.grants.member_removed(project_id, user_id);
+            Ok(())
+        })
+    }
+
+    /// Lets the session `token` hold a sync socket to `project`. Refuses
+    /// with 4401 when the session is missing or expired, and with 4004 when
+    /// the user is not a member. The grant is registered under the database
+    /// lock, so a sign-out or removal either happens before (and the grant is
+    /// refused) or after (and ends it).
+    pub fn grant(&self, token: &str, project: &str) -> Result<Result<Grant, u16>, String> {
+        let hash = Sha256::digest(token.as_bytes()).to_vec();
+        self.with(|c| {
+            let found = c
+                .query_row(
+                    "SELECT u.id, u.email, u.name, s.expires_at FROM sessions s
+                     JOIN users u ON u.id = s.user_id
+                     WHERE s.token_hash = ?1 AND s.expires_at > ?2",
+                    params![hash, now_secs()],
+                    |r| {
+                        Ok((
+                            User {
+                                id: r.get(0)?,
+                                email: r.get(1)?,
+                                name: r.get(2)?,
+                            },
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((user, expires_at)) = found else {
+                return Ok(Err(nisaba_sync::close::SIGNED_OUT));
+            };
+            let role: Option<String> = c
+                .query_row(
+                    "SELECT role FROM members WHERE project_id = ?1 AND user_id = ?2",
+                    params![project, user.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let role = match role.as_deref() {
+                None => return Ok(Err(nisaba_sync::close::NOT_FOUND)),
+                Some("owner" | "editor") => nisaba_sync::Role::Editor,
+                Some("commenter") => nisaba_sync::Role::Commenter,
+                Some(_) => nisaba_sync::Role::Viewer,
+            };
+            Ok(Ok(self.grants.add(hash, user, project, role, expires_at)))
+        })
+    }
+
+    /// The open sync socket grants.
+    #[must_use]
+    pub fn grants(&self) -> &Grants {
+        &self.grants
+    }
+
+    /// Adds `user_id` to a project. Only for tests and tools until
+    /// invitations exist.
+    pub fn add_member(&self, project_id: &str, user_id: &str, role: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO members (project_id, user_id, role) VALUES (?1, ?2, ?3)",
+                params![project_id, user_id, role],
+            )
+            .map(drop)
         })
     }
 
@@ -397,6 +481,30 @@ fn insert_user(
         params![id, email, name, hash, now_secs()],
     )
     .map(drop)
+}
+
+/// Why setup with `code` cannot work now, if it cannot. The code is compared
+/// by SHA-256 in constant time.
+fn setup_refused(c: &Connection, code: Option<&str>) -> rusqlite::Result<Option<Setup>> {
+    let users: i64 = c.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
+    if users > 0 {
+        return Ok(Some(Setup::Taken));
+    }
+    let stored: Option<Vec<u8>> = c
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [SETUP_CODE],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(stored) = stored {
+        use subtle::ConstantTimeEq as _;
+        let given = Sha256::digest(normalize_code(code.unwrap_or("")).as_bytes());
+        if !bool::from(given.as_slice().ct_eq(&stored)) {
+            return Ok(Some(Setup::WrongCode));
+        }
+    }
+    Ok(None)
 }
 
 /// A setup code as typed: hex digits only, lower case. People may copy it

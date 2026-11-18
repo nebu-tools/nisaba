@@ -3,12 +3,15 @@
  *
  * Rules (DESIGN.md section 8): the preview never shows a PDF, and a failed
  * compile shows its problems next to the last good pages, never a server
- * compile in their place. What is sent to the worker and when is decided by
+ * compile in their place. While the newest text does not compile, or the
+ * preview has failed, those pages are dimmed and labelled. Only layouts and
+ * pages of the newest compile reach the screen. At local midnight the
+ * preview compiles again, so `datetime.today()` shows the new day. What is sent to the worker and when is decided by
  * `Feed` (feed.ts); this class owns the worker, the DOM and the metrics.
  */
 import type { LoroDoc } from "loro-crdt"
 import { metrics } from "../app/metrics"
-import { fetchOk } from "./apply"
+import { fetchOk, untilMidnight } from "./apply"
 import { Feed, fileStates } from "./feed"
 import type { FromWorker, Problem, ToWorker } from "./messages"
 
@@ -29,6 +32,11 @@ export class Preview {
   private readonly online = (): void => this.feed.retry()
   private typedAt = 0
   private sentAt = 0
+  private readonly label: HTMLParagraphElement
+  /** The newest compile failed, or the preview itself failed. */
+  private compileFailed = false
+  private previewFailed = false
+  private midnight: ReturnType<typeof setTimeout> | undefined
 
   constructor(
     private readonly pane: HTMLElement,
@@ -42,15 +50,38 @@ export class Preview {
       files: () => fileStates(this.doc),
       post: (msg) => this.post(msg),
       restart: () => this.start(),
-      fetchAsset: async (hash) =>
-        new Uint8Array(await (await fetchOk(`/api/projects/${project}/assets/${hash}`)).arrayBuffer()),
+      fetchAsset: async (hash, signal) =>
+        new Uint8Array(await (await fetchOk(`/api/projects/${project}/assets/${hash}`, signal)).arrayBuffer()),
       view: () => ({ visible: [...this.visible], scale: this.scale() }),
-      failed: (message) => this.events.failed(message),
+      failed: (message) => {
+        this.previewFailed = message !== undefined
+        this.dim()
+        this.events.failed(message)
+      },
       setTimer: (fn, ms) => setTimeout(fn, ms),
       clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout> | undefined),
     })
+    this.label = document.createElement("p")
+    this.label.className = "last-good note"
+    this.label.textContent = "Showing the last version that compiled."
+    this.label.hidden = true
+    pane.append(this.label)
     this.start()
     window.addEventListener("online", this.online)
+    this.atMidnight()
+  }
+
+  private atMidnight(): void {
+    this.midnight = setTimeout(() => {
+      this.feed.changed()
+      this.atMidnight()
+    }, untilMidnight())
+  }
+
+  private dim(): void {
+    const dimmed = this.pages.length > 0 && (this.compileFailed || this.previewFailed)
+    this.pane.classList.toggle("dimmed", dimmed)
+    this.label.hidden = !dimmed
   }
 
   /** Call after any change to the document. */
@@ -65,6 +96,7 @@ export class Preview {
 
   destroy(): void {
     this.feed.stop()
+    clearTimeout(this.midnight)
     this.worker?.terminate()
     this.observer.disconnect()
     window.removeEventListener("online", this.online)
@@ -74,7 +106,10 @@ export class Preview {
   private start(): void {
     this.worker?.terminate()
     const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
-    worker.onmessage = (event: MessageEvent<FromWorker>) => this.receive(event.data)
+    // A message the replaced worker sent before it stopped is not news.
+    worker.onmessage = (event: MessageEvent<FromWorker>) => {
+      if (this.worker === worker) this.receive(event.data)
+    }
     worker.onerror = (event) => {
       event.preventDefault()
       this.feed.workerFailed(event.message || "the worker crashed")
@@ -109,6 +144,11 @@ export class Preview {
   }
 
   private receive(msg: FromWorker): void {
+    if (!this.feed.accepts(msg)) {
+      // A page of an older compile: draw it again from the newest layout.
+      if (msg.type === "page") this.stale.add(msg.index)
+      return
+    }
     if (msg.type === "failed") {
       this.feed.workerFailed(msg.message)
     } else if (msg.type === "layout") {
@@ -127,6 +167,8 @@ export class Preview {
       }
       msg.sizes.forEach(([w, h], i) => (this.pages[i]!.style.aspectRatio = `${w} / ${h}`))
       for (const i of msg.changed) this.stale.add(i)
+      this.compileFailed = !msg.ok
+      this.dim()
     } else if (msg.type === "page") {
       this.stale.delete(msg.index)
       const t = performance.now()
@@ -167,6 +209,7 @@ export class Preview {
         }
       })
       this.feed.done(msg.id)
+      for (const i of this.visible) if (this.stale.delete(i)) this.post({ type: "render", index: i, scale: this.scale() })
     }
   }
 }

@@ -15,9 +15,16 @@ export function setLocalToday(compiler: JsLiveCompiler, now = new Date()): void 
   compiler.set_today(now.getFullYear(), now.getMonth() + 1, now.getDate())
 }
 
+/** Milliseconds from `now` to just after the next local midnight, when
+ * `datetime.today()` changes. */
+export function untilMidnight(now = new Date()): number {
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 1)
+  return next.getTime() - now.getTime()
+}
+
 /** Fetches a URL and fails unless the server answers 200. */
-export async function fetchOk(url: string): Promise<Response> {
-  const response = await fetch(url)
+export async function fetchOk(url: string, signal?: AbortSignal): Promise<Response> {
+  const response = await fetch(url, signal ? { signal } : {})
   if (!response.ok) throw new Error(`${url} answered ${response.status}`)
   return response
 }

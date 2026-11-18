@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 pub const USAGE: &str =
     "usage: nisaba [--data DIR] [--listen ADDR] [--public-url URL] [--allow-insecure-http]
-              [--export-memory-mb N] [--export-seconds N] [--export-parallel N] [--export-queue N]";
+              [--export-memory-mb N] [--export-seconds N] [--export-parallel N] [--export-queue N]
+              [--allow-unsandboxed-export]";
 
 /// Everything the command line sets.
 #[derive(Clone, Debug)]
@@ -51,6 +52,8 @@ pub struct ExportLimits {
     /// Exports that may wait for a free slot. Beyond this the server answers
     /// "busy, try again".
     pub queue: usize,
+    /// Run exports even when this system cannot sandbox them.
+    pub allow_unsandboxed: bool,
 }
 
 impl Default for ExportLimits {
@@ -60,6 +63,7 @@ impl Default for ExportLimits {
             seconds: 60,
             parallel: 2,
             queue: 8,
+            allow_unsandboxed: false,
         }
     }
 }
@@ -76,6 +80,7 @@ impl Settings {
                 "--listen" => s.listen = value()?,
                 "--public-url" => s.public_url = Some(value()?),
                 "--allow-insecure-http" => s.allow_insecure_http = true,
+                "--allow-unsandboxed-export" => s.export.allow_unsandboxed = true,
                 "--export-memory-mb" => s.export.memory_mb = number(&arg, &value()?, 64)?,
                 "--export-seconds" => s.export.seconds = number(&arg, &value()?, 1)?,
                 "--export-parallel" => {
@@ -311,6 +316,7 @@ mod tests {
                 "--export-queue",
                 "0",
                 "--allow-insecure-http",
+                "--allow-unsandboxed-export",
             ]
             .map(String::from),
         )
@@ -318,6 +324,8 @@ mod tests {
         assert_eq!(s.export.seconds, 5);
         assert_eq!(s.export.queue, 0);
         assert!(s.allow_insecure_http);
+        assert!(s.export.allow_unsandboxed);
+        assert!(!Settings::default().export.allow_unsandboxed);
         assert!(Settings::parse(["--export-parallel", "0"].map(String::from)).is_err());
         assert!(Settings::parse(["--nope"].map(String::from)).is_err());
     }

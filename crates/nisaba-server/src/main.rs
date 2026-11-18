@@ -65,7 +65,7 @@ async fn serve(settings: Settings) {
         .prepare_setup(!local_only)
         .unwrap_or_else(|e| exit(&e));
     let exporter = Exporter::new(Exporter::this_binary(), settings.export.clone());
-    let app = http::App::new(store, public.clone(), exporter);
+    let app = http::App::new(store, public.clone(), exporter.clone());
     app.rooms().spawn_sweeper(Duration::from_secs(60));
     // Tests and scripts read these lines: the port, the setup code, and the
     // public address, which always comes last.
@@ -80,14 +80,44 @@ async fn serve(settings: Settings) {
             public.origin()
         );
     }
+    println!("{}", exporter.describe());
     println!("public address {}", public.origin());
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+    let (stopping, mut stopped) = tokio::sync::watch::channel(false);
+    let shutdown = async move {
+        stop_signal().await;
+        tracing::info!("stopping");
+        // Exports end at once, their children killed and reaped.
+        exporter.stop();
+        stopping.send_replace(true);
     };
-    if let Err(e) = axum::serve(listener, http::router(app))
-        .with_graceful_shutdown(shutdown)
-        .await
-    {
-        exit(&format!("server stopped: {e}"));
+    let serve = axum::serve(listener, http::router(app)).with_graceful_shutdown(shutdown);
+    // Open sync sockets would hold a graceful shutdown for ever.
+    let grace = async move {
+        let _ = stopped.wait_for(|s| *s).await;
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+    };
+    tokio::select! {
+        result = serve => if let Err(e) = result {
+            exit(&format!("server stopped: {e}"));
+        },
+        () = grace => tracing::info!("stopped with connections still open"),
     }
+}
+
+/// How long a stopping server waits for open requests and sockets.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Ctrl-C, or SIGTERM as from systemd or `kill`.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
