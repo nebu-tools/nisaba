@@ -214,6 +214,8 @@ impl Exporter {
         } else {
             "optional"
         };
+        // The child refuses to run with a descriptor it does not need.
+        crate::sandbox::keep_descriptors();
         let child = tokio::process::Command::new(&*self.exe)
             .arg(SUBCOMMAND)
             .arg(self.limits.memory_mb.to_string())

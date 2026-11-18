@@ -144,7 +144,9 @@ A project's stored document, its snapshot plus its log, may grow to 32 MiB.
 The limit covers the text and its history. Asset files do not count toward
 it, and asset storage has no limit yet. An update past the limit is refused
 with close code 4130. When the update comes in parts (section 4), the server
-refuses it at its declared length, before any part arrives. An upload or
+refuses it at its declared length, before any part arrives. An update that
+would fit, but for the space an unfinished update in parts holds, is closed
+with 1013 and sent again. An upload or
 import whose file entries would pass the limit gets HTTP 413. The limit holds
 after a restart, because the room counts what the store holds.
 
@@ -235,10 +237,12 @@ directions use the same code (`split` and `Assembler` in `nisaba-sync`, and
 
 - The receiver keeps at most the declared total. When the Begin arrives,
   the server reserves the declared total against what the project has left
-  under its 32 MiB limit, and closes with 4130 before it keeps a single part
-  if it does not fit. The reservation counts as stored until the update is
+  under its 32 MiB limit, and closes before it keeps a single part if it
+  does not fit. The reservation counts as stored until the update is
   written or the transfer ends, so two clients cannot each start a transfer
-  that fits only alone.
+  that fits only alone. The close code is 4130 when the update is too large
+  for what the project stores, and 1013 when only another reservation is in
+  the way, because that one ends.
 - All transfers on the server together hold at most `--sync-transfer-mb`
   MiB (default 256, at least 32). A Begin beyond that is closed with 1013,
   and the client sends again after its backoff.
@@ -347,12 +351,12 @@ In the unsafe state the page asks for confirmation before it closes.
 | 1006 | Connection lost | Reconnect with backoff. |
 | 4000 | Malformed frame, or parts out of order | Reconnect with backoff. After three in a row with no Ack between them, stop and show "Sync failed" with a Reload button. |
 | 4004 | Unknown project, or the user is not a member, or stopped being one | Stop; the save state says "Stopped" with the reason. |
-| 1013 | Try again later: the server holds too many large updates in parts at once | Reconnect with backoff and send again. |
+| 1013 | Try again later: the server holds too many large updates in parts at once, or an unfinished one holds the space this update needs in its project | Reconnect with backoff and send again. |
 | 4002 | Too slow | The client did not read its frames: its queue on the server filled, or one frame waited 30 s to be sent. Reconnect with backoff. |
 | 4008 | An update in parts did not finish before its deadline | Reconnect with backoff and send again. |
 | 4003 | Not allowed | Planned: reload the role and continue read-only. Today the client stops as for 4004. Local changes stay in IndexedDB. |
 | 4029 | Too many connections: the project has too many sockets, or the account has 32 open | Reconnect with backoff. |
-| 4130 | The update, or its declared length, does not fit in what is left of the project's 32 MiB | Stop; do not retry. The save state says "Not saved: the project is full", and a note says that the edits are kept on this device and that copying the text into a new project lets the user go on. |
+| 4130 | The update, or its declared length, does not fit beside what the project stores, under its 32 MiB | Stop; do not retry. The save state says "Not saved: the project is full", and a note says that the edits are kept on this device and that copying the text into a new project lets the user go on. |
 | 4400 | Protocol version mismatch | Show "Nisaba was updated. Reload to continue." Local changes stay in IndexedDB and go out after the reload. |
 | 4401 | No valid session: never had one, signed out, expired, or the account was deleted | Stop; the save state says "Stopped" with the reason. A reload shows the sign-in screen. Local changes stay in IndexedDB. |
 | 4409 | Project replaced | Planned with the archive (section 10): offer the unsent changes as a download, then clear the device log and reload. |
@@ -748,7 +752,10 @@ A document is a program, and `#("x" * 1000000000000)` or a loop that never
 ends is a valid one. The export therefore runs in a child: the server starts
 its own binary with the hidden subcommand `__export`, an empty environment
 and the temporary directory as working directory, writes the files to its
-standard input and reads the PDF from its standard output. The child:
+standard input and reads the PDF from its standard output. Before it starts
+the child, the server marks every descriptor it holds beyond 0, 1 and 2
+close-on-exec, also those it was started with, so the child inherits none.
+The child:
 
 1. asks the kernel to kill it when the server ends (`PR_SET_PDEATHSIG`);
 2. sets `RLIMIT_AS` to the memory limit, `RLIMIT_CPU` to the time limit plus

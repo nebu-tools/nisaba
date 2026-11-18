@@ -35,6 +35,7 @@ landlock = "0.4"
 rustix = { version = "1", features = ["process", "fs", "thread"] }
 seccompiler = "0.5"
 libc = "0.2"
+close_fds = "0.3.2"
 
 [[test]]
 name = "sandbox"

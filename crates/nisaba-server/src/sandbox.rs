@@ -12,8 +12,10 @@
 //! - Privileges: it runs with `no_new_privs`.
 //!
 //! Landlock (ABI 3, Linux 6.2) keeps the file promise. A seccomp filter
-//! keeps the socket and process promises. The child checks its descriptors
-//! and threads itself before it confines itself.
+//! keeps the socket and process promises. Before the server starts a child
+//! it marks every descriptor it holds close-on-exec ([`keep_descriptors`]),
+//! also those it was started with. The child checks its descriptors and
+//! threads itself before it confines itself.
 //!
 //! [`probe`] decides at start whether the running kernel keeps every
 //! promise. There is no middle state: an export is sandboxed or it is not.
@@ -100,6 +102,20 @@ fn detect() -> Kernel {
         seccomp: Err("seccomp exists only on Linux".into()),
     }
 }
+
+/// Marks every descriptor of this process beyond 0, 1 and 2 close-on-exec,
+/// so a child started after it inherits none of them. Rust opens its own
+/// files this way. This covers the rest: the descriptors the server was
+/// started with, which a supervisor or a test runner may leave open, and any
+/// that a C library opened.
+#[cfg(target_os = "linux")]
+pub fn keep_descriptors() {
+    close_fds::set_fds_cloexec_threadsafe(3, &[]);
+}
+
+/// Nothing to do where there is no sandbox to keep the promise for.
+#[cfg(not(target_os = "linux"))]
+pub fn keep_descriptors() {}
 
 /// Fails unless this process has no file descriptor but 0, 1 and 2 and no
 /// thread but this one. A thread started before [`confine`] would escape it,

@@ -159,6 +159,9 @@ mod linux {
         let dir = tempfile::tempdir().unwrap();
         let leaked = std::fs::File::create(dir.path().join("leaked")).unwrap();
         let export = |leak: bool| {
+            // As the server does before it starts a child. The test runner
+            // may have started this process with descriptors of its own.
+            nisaba_server::sandbox::keep_descriptors();
             let flags = if leak {
                 rustix::io::FdFlags::empty()
             } else {
