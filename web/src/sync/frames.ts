@@ -37,8 +37,12 @@ const PART_TYPE = 8
 /** WebSocket close codes the server sends. */
 export const Close = {
   normal: 1000,
+  /** The server holds as many unfinished large updates as it may. */
+  tryAgain: 1013,
   malformed: 4000,
   tooSlow: 4002,
+  /** A large update did not arrive by its deadline; nothing of it was kept. */
+  timedOut: 4008,
   forbidden: 4003,
   notFound: 4004,
   full: 4029,
@@ -50,12 +54,19 @@ export const Close = {
 
 export class FrameError extends Error {}
 
+/** Lengths, totals and part numbers are u32 on the wire. DataView would
+ * wrap a larger number silently. */
+function u32(n: number, what: string): number {
+  if (!Number.isInteger(n) || n < 0 || n > 0xffff_ffff) throw new FrameError(`${what} ${n} does not fit in 32 bits`)
+  return n
+}
+
 export function encode(frame: Frame): Uint8Array<ArrayBuffer> {
   const blobs = (...bs: Uint8Array[]): number => bs.reduce((n, b) => n + 4 + b.length, 0)
   let out: Uint8Array<ArrayBuffer>
   let at = 1
   const put = (b: Uint8Array): void => {
-    new DataView(out.buffer).setUint32(at, b.length)
+    new DataView(out.buffer).setUint32(at, u32(b.length, "a blob of"))
     out.set(b, at + 4)
     at += 4 + b.length
   }
@@ -63,6 +74,9 @@ export function encode(frame: Frame): Uint8Array<ArrayBuffer> {
     case "hello":
       out = new Uint8Array(2 + blobs(frame.version))
       out[0] = HELLO
+      if (!Number.isInteger(frame.protocol) || frame.protocol < 0 || frame.protocol > 255) {
+        throw new FrameError(`protocol ${frame.protocol} does not fit in a byte`)
+      }
       out[1] = frame.protocol
       at = 2
       put(frame.version)
@@ -94,12 +108,12 @@ export function encode(frame: Frame): Uint8Array<ArrayBuffer> {
     case "begin":
       out = new Uint8Array(5)
       out[0] = BEGIN
-      new DataView(out.buffer).setUint32(1, frame.total)
+      new DataView(out.buffer).setUint32(1, u32(frame.total, "a Begin of"))
       break
     case "part":
       out = new Uint8Array(5 + blobs(frame.bytes))
       out[0] = PART_TYPE
-      new DataView(out.buffer).setUint32(1, frame.index)
+      new DataView(out.buffer).setUint32(1, u32(frame.index, "part"))
       at = 5
       put(frame.bytes)
       break
@@ -176,14 +190,15 @@ export function split(frame: Frame, part = PART): Uint8Array<ArrayBuffer>[] {
 }
 
 /**
- * Puts frames sent in parts back together, for one connection. The buffer
- * is the declared length and never grows. Nothing comes out until the last
+ * Puts frames sent in parts back together, for one connection. It keeps the
+ * parts as they come and joins them at the end, so it never holds more than
+ * arrived, whatever a Begin declares. Nothing comes out until the last
  * part, so a frame is used whole or not at all. A part missing, repeated or
  * out of order, more bytes than declared, a Part without a Begin, or another
  * frame among the parts is a FrameError, and the frame is dropped.
  */
 export class Assembler {
-  private open: { buf: Uint8Array; at: number; next: number } | undefined
+  private open: { total: number; parts: Uint8Array[]; at: number; next: number } | undefined
 
   constructor(private readonly part = PART) {}
 
@@ -198,7 +213,7 @@ export class Assembler {
       if (frame.type !== "begin") return frame
       if (frame.total === 0) throw new FrameError("a Begin of 0 bytes")
       allow(frame.total)
-      this.open = { buf: new Uint8Array(frame.total), at: 0, next: 0 }
+      this.open = { total: frame.total, parts: [], at: 0, next: 0 }
       return undefined
     }
     this.open = undefined
@@ -206,15 +221,21 @@ export class Assembler {
     if (frame.index !== open.next || frame.bytes.length === 0) {
       throw new FrameError(`expected part ${open.next}, got ${frame.index}`)
     }
-    if (open.at + frame.bytes.length > open.buf.length) throw new FrameError("more bytes than the Begin declared")
-    open.buf.set(frame.bytes, open.at)
+    if (open.at + frame.bytes.length > open.total) throw new FrameError("more bytes than the Begin declared")
+    open.parts.push(frame.bytes)
     open.at += frame.bytes.length
     open.next++
-    if (open.at < open.buf.length) {
+    if (open.at < open.total) {
       this.open = open
       return undefined
     }
-    const whole = decode(open.buf)
+    const buf = new Uint8Array(open.total)
+    let at = 0
+    for (const part of open.parts) {
+      buf.set(part, at)
+      at += part.length
+    }
+    const whole = decode(buf)
     if (whole.type === "begin" || whole.type === "part") throw new FrameError("parts inside parts")
     return whole
   }

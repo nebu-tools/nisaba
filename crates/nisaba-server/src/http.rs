@@ -60,9 +60,16 @@ pub struct App {
 
 impl App {
     #[must_use]
-    pub fn new(store: Store, public: PublicAddress, exporter: Exporter) -> Self {
+    /// `transfer_bytes` is the memory all unfinished multi-part updates may
+    /// hold together.
+    pub fn new(
+        store: Store,
+        public: PublicAddress,
+        exporter: Exporter,
+        transfer_bytes: usize,
+    ) -> Self {
         Self {
-            rooms: Rooms::new(store.clone()),
+            rooms: Rooms::new(store.clone(), transfer_bytes),
             store,
             public: Arc::new(public),
             exporter,

@@ -41,6 +41,40 @@ describe("frames", () => {
   })
 })
 
+describe("32-bit fields", () => {
+  const max = 0xffff_ffff
+
+  it("carry the largest u32 and refuse anything past it", () => {
+    expect([...encode({ type: "begin", total: max })]).toEqual([7, 255, 255, 255, 255])
+    expect(decode(encode({ type: "begin", total: max }))).toEqual({ type: "begin", total: max })
+    const part: Frame = { type: "part", index: max, bytes: b(1) }
+    expect(decode(encode(part))).toEqual(part)
+    for (const n of [max + 1, 2 ** 53, -1, 1.5, Number.NaN]) {
+      expect(() => encode({ type: "begin", total: n })).toThrow(FrameError)
+      expect(() => encode({ type: "part", index: n, bytes: b(1) })).toThrow(FrameError)
+    }
+    expect(() => encode({ type: "hello", protocol: 256, version: b() })).toThrow(FrameError)
+  })
+
+  it("read a length of the largest u32 as truncated, not as a wrap", () => {
+    expect(() => decode(b(3, 255, 255, 255, 255, 1, 2))).toThrow("truncated")
+    expect(() => decode(b(7, 255, 255, 255))).toThrow("truncated")
+  })
+
+  it("let a Begin declare the largest u32 without holding that much", () => {
+    const parts = new Assembler(10)
+    let declared = 0
+    expect(parts.push(encode({ type: "begin", total: max }), (t) => (declared = t))).toBeUndefined()
+    expect(declared).toBe(max)
+    expect(parts.push(encode({ type: "part", index: 0, bytes: b(3, 0, 0, 0, 1) }))).toBeUndefined()
+    expect(() => parts.push(encode({ type: "part", index: 2, bytes: b(1) }))).toThrow("expected part 1, got 2")
+  })
+
+  it("number parts past 2^31 the same as the server", () => {
+    expect([...encode({ type: "part", index: 2 ** 31, bytes: b(9) })]).toEqual([8, 128, 0, 0, 0, 0, 0, 0, 1, 9])
+  })
+})
+
 describe("parts", () => {
   const big: Frame = { type: "update", update: Uint8Array.from({ length: 45 }, (_, i) => i) }
   const messages = split(big, 10)

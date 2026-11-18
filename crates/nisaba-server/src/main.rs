@@ -65,7 +65,9 @@ async fn serve(settings: Settings) {
         .prepare_setup(!local_only)
         .unwrap_or_else(|e| exit(&e));
     let exporter = Exporter::new(Exporter::this_binary(), settings.export.clone());
-    let app = http::App::new(store, public.clone(), exporter.clone());
+    let transfer_bytes = usize::try_from(settings.sync_transfer_mb << 20)
+        .unwrap_or_else(|_| exit("--sync-transfer-mb is too large for this system"));
+    let app = http::App::new(store, public.clone(), exporter.clone(), transfer_bytes);
     app.rooms().spawn_sweeper(Duration::from_secs(60));
     // Tests and scripts read these lines: the port, the setup code, and the
     // public address, which always comes last.

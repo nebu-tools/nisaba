@@ -543,14 +543,25 @@ impl RoomStore for Store {
         })
     }
 
-    fn append(&self, project: &str, update: &[u8]) -> Result<(), String> {
+    /// Checks `admit` under the database lock, the lock every sign-out and
+    /// removal ends its grants under, so access ends either before the
+    /// append (and nothing is written) or after it.
+    fn append(
+        &self,
+        project: &str,
+        update: &[u8],
+        admit: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
         self.with(|c| {
+            if !admit() {
+                return Ok(false);
+            }
             c.execute(
                 "INSERT INTO doc_updates (project_id, seq, bytes) VALUES (?1,
                    (SELECT coalesce(max(seq), 0) + 1 FROM doc_updates WHERE project_id = ?1), ?2)",
                 params![project, update],
-            )
-            .map(drop)
+            )?;
+            Ok(true)
         })
     }
 
@@ -594,5 +605,38 @@ impl RoomStore for Store {
             }
             tx.commit()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use nisaba_sync::RoomStore as _;
+
+    use super::*;
+
+    /// The room asks whether a grant still holds while the database lock is
+    /// held, and sign-outs and removals end grants under that lock, so no
+    /// update is written after access ended.
+    #[test]
+    fn an_append_asks_for_access_under_the_lock_that_ends_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.create_user("u", "u@example.org", "U", "x").unwrap();
+        store.create_session("t", "u", 86_400).unwrap();
+        store.create_project("p", "P", "u").unwrap();
+        let grant = store.grant("t", "p").unwrap().unwrap();
+        let admits = grant.admits();
+        let locked = AtomicBool::new(false);
+        let asked = |admit: &nisaba_sync::Admit| {
+            locked.store(store.conn.try_lock().is_err(), Ordering::SeqCst);
+            admit()
+        };
+        assert!(store.append("p", b"one", &|| asked(&admits)).unwrap());
+        assert!(locked.load(Ordering::SeqCst), "asked outside the lock");
+        store.delete_session("t").unwrap();
+        assert!(!store.append("p", b"two", &|| asked(&admits)).unwrap());
+        assert_eq!(store.log_len("p").unwrap(), 1);
     }
 }

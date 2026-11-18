@@ -32,8 +32,14 @@ pub const UPDATE_HEADER: usize = 5;
 /// WebSocket close codes the server sends.
 pub mod close {
     pub const NORMAL: u16 = 1000;
+    /// The server holds as many unfinished updates as it may; send the
+    /// update again after a delay.
+    pub const TRY_AGAIN: u16 = 1013;
     pub const MALFORMED: u16 = 4000;
     pub const TOO_SLOW: u16 = 4002;
+    /// A multi-part update did not arrive by its deadline. Nothing of it was
+    /// kept; send it again after reconnecting.
+    pub const TIMED_OUT: u16 = 4008;
     pub const FORBIDDEN: u16 = 4003;
     /// The project does not exist or the user is not a member, or no longer
     /// one.

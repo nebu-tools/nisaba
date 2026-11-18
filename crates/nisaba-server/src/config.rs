@@ -11,7 +11,7 @@ use std::path::PathBuf;
 pub const USAGE: &str =
     "usage: nisaba [--data DIR] [--listen ADDR] [--public-url URL] [--allow-insecure-http]
               [--export-memory-mb N] [--export-seconds N] [--export-parallel N] [--export-queue N]
-              [--allow-unsandboxed-export]";
+              [--allow-unsandboxed-export] [--sync-transfer-mb N]";
 
 /// Everything the command line sets.
 #[derive(Clone, Debug)]
@@ -26,6 +26,9 @@ pub struct Settings {
     /// cookies then cross the network unencrypted.
     pub allow_insecure_http: bool,
     pub export: ExportLimits,
+    /// Memory for unfinished multi-part updates across all sync sockets, in
+    /// MiB. A Begin beyond it is told to try again later.
+    pub sync_transfer_mb: u64,
 }
 
 impl Default for Settings {
@@ -36,6 +39,7 @@ impl Default for Settings {
             public_url: None,
             allow_insecure_http: false,
             export: ExportLimits::default(),
+            sync_transfer_mb: 256,
         }
     }
 }
@@ -83,6 +87,8 @@ impl Settings {
                 "--allow-unsandboxed-export" => s.export.allow_unsandboxed = true,
                 "--export-memory-mb" => s.export.memory_mb = number(&arg, &value()?, 64)?,
                 "--export-seconds" => s.export.seconds = number(&arg, &value()?, 1)?,
+                // One update may be 32 MiB, so less could never take one.
+                "--sync-transfer-mb" => s.sync_transfer_mb = number(&arg, &value()?, 32)?,
                 "--export-parallel" => {
                     s.export.parallel =
                         usize::try_from(number(&arg, &value()?, 1)?).map_err(|e| e.to_string())?;
@@ -317,10 +323,15 @@ mod tests {
                 "0",
                 "--allow-insecure-http",
                 "--allow-unsandboxed-export",
+                "--sync-transfer-mb",
+                "64",
             ]
             .map(String::from),
         )
         .unwrap();
+        assert_eq!(s.sync_transfer_mb, 64);
+        assert_eq!(Settings::default().sync_transfer_mb, 256);
+        assert!(Settings::parse(["--sync-transfer-mb", "31"].map(String::from)).is_err());
         assert_eq!(s.export.seconds, 5);
         assert_eq!(s.export.queue, 0);
         assert!(s.allow_insecure_http);

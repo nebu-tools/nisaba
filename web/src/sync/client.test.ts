@@ -66,9 +66,11 @@ function setup(): {
   log: FakeLog
   states: [SaveState, string | undefined][]
   reconnect: () => void
+  delays: number[]
 } {
   const sockets: FakeSocket[] = []
   const log = new FakeLog()
+  const delays: number[] = []
   let timer: (() => void) | undefined
   const host: ClientHost = {
     openLog: () => Promise.resolve(log as unknown as DeviceLog),
@@ -77,7 +79,10 @@ function setup(): {
       sockets.push(s)
       return s as unknown as WebSocket
     },
-    setTimeout: (f) => (timer = f),
+    setTimeout: (f, ms) => {
+      delays.push(ms)
+      timer = f
+    },
   }
   const client = new SyncClient("p", host)
   const states: [SaveState, string | undefined][] = []
@@ -87,7 +92,7 @@ function setup(): {
     timer = undefined
     f?.()
   }
-  return { client, sockets, log, states, reconnect }
+  return { client, sockets, log, states, reconnect, delays }
 }
 
 const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
@@ -162,6 +167,35 @@ describe("sync client", () => {
     fresh.importBatch([...log.rows.values()])
     expect(fresh.getText("t").toString()).toBe("kept")
     expect(sockets.length).toBe(1)
+  })
+
+  it("sends an update again after 4008 and 1013, waiting longer each time until an Ack", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
+    const { client, sockets, reconnect, delays } = setup()
+    await client.start()
+    welcome(sockets[0]!)
+    client.doc.getText("t").insert(0, "kept")
+    client.doc.commit()
+    const updates = (s: FakeSocket): number => s.frames().filter((f) => f.type === "update").length
+    expect(updates(sockets[0]!)).toBe(1)
+    sockets[0]!.close(Close.timedOut, "the update did not arrive in time")
+    for (const code of [Close.tryAgain, Close.tryAgain]) {
+      reconnect()
+      const s = sockets.at(-1)!
+      welcome(s)
+      expect(updates(s)).toBe(1)
+      s.close(code, "try again later")
+    }
+    expect(client.state()).toBe("offline")
+    expect(delays).toEqual([500, 1000, 2000])
+    reconnect()
+    const s = sockets.at(-1)!
+    welcome(s)
+    s.frame({ type: "ack", version: client.doc.oplogVersion().encode() })
+    expect(client.state()).toBe("saved")
+    s.close(Close.tooSlow)
+    expect(delays.at(-1)).toBe(500)
+    vi.restoreAllMocks()
   })
 
   it("says Nisaba was updated at 4400", async () => {

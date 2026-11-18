@@ -16,8 +16,16 @@ pub struct Stored {
 pub trait RoomStore: Send + Sync + 'static {
     fn load(&self, project: &str) -> Result<Stored, String>;
 
-    /// Appends one update. Returns only after the update is durable.
-    fn append(&self, project: &str, update: &[u8]) -> Result<(), String>;
+    /// Appends one update if `admit` allows it at the moment of writing.
+    /// Returns `false`, and stores nothing, when it does not; otherwise
+    /// returns `true` only after the update is durable. A store that ends
+    /// access under the same lock orders that end before or after the write.
+    fn append(
+        &self,
+        project: &str,
+        update: &[u8],
+        admit: &dyn Fn() -> bool,
+    ) -> Result<bool, String>;
 
     /// Replaces the snapshot and removes every log entry that `covers`
     /// includes, in one atomic step.
@@ -40,13 +48,21 @@ impl RoomStore for MemoryStore {
             .unwrap_or_default())
     }
 
-    fn append(&self, project: &str, update: &[u8]) -> Result<(), String> {
+    fn append(
+        &self,
+        project: &str,
+        update: &[u8],
+        admit: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
         let mut map = self.0.lock().unwrap();
+        if !admit() {
+            return Ok(false);
+        }
         map.entry(project.to_owned())
             .or_default()
             .log
             .push(update.to_vec());
-        Ok(())
+        Ok(true)
     }
 
     fn compact(

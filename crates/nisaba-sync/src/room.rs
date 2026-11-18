@@ -12,9 +12,17 @@
 //! The update is appended before it is imported, so the document never holds
 //! an operation that is not durable. Every version vector the room sends is
 //! therefore safe to count as saved.
+//!
+//! The store checks each session's [`Admit`] in the same step as the append,
+//! so an update from a session whose access ended is neither stored nor sent
+//! on.
+//!
+//! The quota counts what is stored and what unfinished multi-part updates
+//! have reserved ([`Room::reserve`]). An update fits only in what neither
+//! holds.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use loro::{ExportMode, LoroDoc, VersionVector};
@@ -35,6 +43,10 @@ pub enum Role {
     Commenter,
     Viewer,
 }
+
+/// Whether a session may still write. The store asks at the moment of the
+/// append.
+pub type Admit = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// A session in a room. Its numbers are never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,6 +88,7 @@ impl Default for Limits {
 struct Session {
     role: Role,
     tx: mpsc::Sender<Arc<Frame>>,
+    admit: Admit,
 }
 
 struct State {
@@ -90,13 +103,34 @@ struct Log {
     snapshot: usize,
 }
 
+/// What counts against `max_document`.
+#[derive(Default)]
+struct Quota {
+    /// `snapshot + bytes` of the log, readable without waiting for `write`.
+    stored: usize,
+    /// Bytes held for updates that have not arrived or been written yet.
+    reserved: usize,
+}
+
+/// Space held in a room's quota for one update. Dropping it gives the space
+/// back; writing the update turns it into stored bytes.
+pub struct Reservation {
+    quota: Arc<Mutex<Quota>>,
+    len: usize,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        lock(&self.quota).reserved -= self.len;
+    }
+}
+
 pub struct Room<S> {
     project: String,
     store: Arc<S>,
     limits: Limits,
     write: tokio::sync::Mutex<Log>,
-    /// `snapshot + bytes` of `write`, readable without waiting for it.
-    stored: AtomicUsize,
+    quota: Arc<Mutex<Quota>>,
     state: Mutex<State>,
     next_peer: AtomicU64,
 }
@@ -123,7 +157,10 @@ impl<S: RoomStore> Room<S> {
             project: project.to_owned(),
             store,
             limits,
-            stored: AtomicUsize::new(log.snapshot + log.bytes),
+            quota: Arc::new(Mutex::new(Quota {
+                stored: log.snapshot + log.bytes,
+                reserved: 0,
+            })),
             write: tokio::sync::Mutex::new(log),
             state: Mutex::new(State {
                 doc,
@@ -135,8 +172,14 @@ impl<S: RoomStore> Room<S> {
 
     /// Starts a session from the client's Hello. The returned queue starts
     /// with Welcome and then carries every frame for this client. When the
-    /// room drops a client as too slow, the queue ends.
-    pub fn join(&self, role: Role, hello: Frame) -> SyncResult<(Peer, mpsc::Receiver<Arc<Frame>>)> {
+    /// room drops a client as too slow, the queue ends. The session's
+    /// updates are written only while `admit` allows it.
+    pub fn join(
+        &self,
+        role: Role,
+        hello: Frame,
+        admit: Admit,
+    ) -> SyncResult<(Peer, mpsc::Receiver<Arc<Frame>>)> {
         let Frame::Hello { protocol, version } = hello else {
             return Err(SyncError::Unexpected);
         };
@@ -171,7 +214,7 @@ impl<S: RoomStore> Room<S> {
         }))
         .expect("a new queue has room");
         let peer = Peer(self.next_peer.fetch_add(1, Ordering::Relaxed));
-        state.sessions.insert(peer, Session { role, tx });
+        state.sessions.insert(peer, Session { role, tx, admit });
         Ok((peer, rx))
     }
 
@@ -180,19 +223,25 @@ impl<S: RoomStore> Room<S> {
     }
 
     /// Handles one frame from a joined client. Replies go to its queue.
-    pub async fn receive(&self, peer: Peer, frame: Frame) -> SyncResult<()> {
-        let role = self
+    /// `held` is the space reserved for it when it came in parts.
+    pub async fn receive(
+        &self,
+        peer: Peer,
+        frame: Frame,
+        held: Option<Reservation>,
+    ) -> SyncResult<()> {
+        let (role, admit) = self
             .lock()
             .sessions
             .get(&peer)
-            .map(|s| s.role)
+            .map(|s| (s.role, Arc::clone(&s.admit)))
             .ok_or(SyncError::TooSlow)?;
         match frame {
             Frame::Update(update) => {
                 if role != Role::Editor {
                     return Err(SyncError::Forbidden);
                 }
-                let version = self.write_update(&update, Some(peer)).await?;
+                let version = self.write_update(&update, Some(peer), held, &admit).await?;
                 self.send(peer, Frame::Ack(version));
                 Ok(())
             }
@@ -220,7 +269,10 @@ impl<S: RoomStore> Room<S> {
     /// Applies an update the server made itself, such as an upload or a
     /// restore. It takes the same path as a client's update.
     pub async fn apply(&self, update: &[u8]) -> SyncResult<()> {
-        self.write_update(update, None).await.map(drop)
+        let always: Admit = Arc::new(|| true);
+        self.write_update(update, None, None, &always)
+            .await
+            .map(drop)
     }
 
     /// Reads the document.
@@ -232,21 +284,40 @@ impl<S: RoomStore> Room<S> {
         Ok(self.lock().doc.export(ExportMode::Snapshot)?)
     }
 
-    /// How many bytes the project may still grow by.
+    /// How many bytes the project may still grow by: neither stored nor
+    /// reserved.
     #[must_use]
     pub fn space(&self) -> usize {
-        self.limits
-            .max_document
-            .saturating_sub(self.stored.load(Ordering::Relaxed))
+        let quota = lock(&self.quota);
+        self.left(&quota, 0)
     }
 
-    /// Refuses an update of `len` bytes that cannot fit, before it arrives.
-    pub fn fits(&self, len: usize) -> SyncResult<()> {
-        let left = self.space();
+    /// The bytes stored for the project, snapshot and log.
+    #[must_use]
+    pub fn stored(&self) -> usize {
+        lock(&self.quota).stored
+    }
+
+    /// Holds `len` bytes of the quota for an update that is on its way, or
+    /// refuses it when they are not there.
+    pub fn reserve(&self, len: usize) -> SyncResult<Reservation> {
+        let mut quota = lock(&self.quota);
+        let left = self.left(&quota, 0);
         if len > left {
             return Err(SyncError::ProjectFull { need: len, left });
         }
-        Ok(())
+        quota.reserved += len;
+        Ok(Reservation {
+            quota: Arc::clone(&self.quota),
+            len,
+        })
+    }
+
+    /// What is left when `mine` of the reserved bytes are the caller's own.
+    fn left(&self, quota: &Quota, mine: usize) -> usize {
+        self.limits
+            .max_document
+            .saturating_sub(quota.stored + quota.reserved - mine)
     }
 
     #[must_use]
@@ -256,7 +327,13 @@ impl<S: RoomStore> Room<S> {
 
     /// Checks, appends, imports and fans out one update, then compacts if the
     /// log is long. Returns the encoded version vector after the import.
-    async fn write_update(&self, update: &[u8], from: Option<Peer>) -> SyncResult<Vec<u8>> {
+    async fn write_update(
+        &self,
+        update: &[u8],
+        from: Option<Peer>,
+        held: Option<Reservation>,
+        admit: &Admit,
+    ) -> SyncResult<Vec<u8>> {
         let meta = LoroDoc::decode_import_blob_meta(update, true)?;
         // A throwaway import proves the bytes decode before they reach the log.
         LoroDoc::new().import(update)?;
@@ -265,22 +342,43 @@ impl<S: RoomStore> Room<S> {
         if self.lock().doc.oplog_vv().includes_vv(&meta.partial_end_vv) {
             return Ok(self.lock().doc.oplog_vv().encode());
         }
-        let left = self
-            .limits
-            .max_document
-            .saturating_sub(log.snapshot + log.bytes);
-        if update.len() > left {
-            return Err(SyncError::ProjectFull {
-                need: update.len(),
-                left,
-            });
+        // The update holds exactly its own length while it is written, so
+        // no Begin can take that space in the meantime.
+        let mut held = held.unwrap_or(Reservation {
+            quota: Arc::clone(&self.quota),
+            len: 0,
+        });
+        {
+            let mut quota = lock(&self.quota);
+            let left = self.left(&quota, held.len);
+            if update.len() > left {
+                return Err(SyncError::ProjectFull {
+                    need: update.len(),
+                    left,
+                });
+            }
+            quota.reserved = quota.reserved - held.len + update.len();
+            held.len = update.len();
         }
         let bytes = update.to_vec();
-        blocking(&self.store, &self.project, move |s, p| s.append(p, &bytes)).await?;
+        let admit = Arc::clone(admit);
+        // The store asks `admit` inside its own lock, in the step that
+        // appends, so access cannot end between the check and the write.
+        if !blocking(&self.store, &self.project, move |s, p| {
+            s.append(p, &bytes, &*admit)
+        })
+        .await?
+        {
+            return Err(SyncError::Ended);
+        }
         log.entries += 1;
         log.bytes += update.len();
-        self.stored
-            .store(log.snapshot + log.bytes, Ordering::Relaxed);
+        {
+            let mut quota = lock(&self.quota);
+            quota.stored = log.snapshot + log.bytes;
+            quota.reserved -= held.len;
+            held.len = 0;
+        }
 
         let version = {
             let mut st = self.lock();
@@ -306,7 +404,7 @@ impl<S: RoomStore> Room<S> {
                         bytes: 0,
                         snapshot: snapshot_len,
                     };
-                    self.stored.store(snapshot_len, Ordering::Relaxed);
+                    lock(&self.quota).stored = snapshot_len;
                 }
                 // The log still holds everything, so a failed compaction loses
                 // nothing. The next update tries again.
@@ -326,10 +424,14 @@ impl<S: RoomStore> Room<S> {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock(&self.state)
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Queues `frame` for every session but `except`. A session whose queue is
@@ -374,6 +476,10 @@ mod tests {
         }
     }
 
+    fn open() -> Admit {
+        Arc::new(|| true)
+    }
+
     async fn room(store: &Arc<MemoryStore>, limits: Limits) -> Room<MemoryStore> {
         Room::open("p", Arc::clone(store), limits).await.unwrap()
     }
@@ -389,14 +495,14 @@ mod tests {
     async fn an_update_is_stored_before_its_ack() {
         let store = Arc::new(MemoryStore::default());
         let room = room(&store, Limits::default()).await;
-        let (a, mut rx_a) = room.join(Role::Editor, hello(&[])).unwrap();
-        let (_b, mut rx_b) = room.join(Role::Editor, hello(&[])).unwrap();
+        let (a, mut rx_a) = room.join(Role::Editor, hello(&[]), open()).unwrap();
+        let (_b, mut rx_b) = room.join(Role::Editor, hello(&[]), open()).unwrap();
         welcome(&mut rx_a);
         welcome(&mut rx_b);
 
         let doc = LoroDoc::new();
         let update = edit(&doc, "hello");
-        room.receive(a, Frame::Update(update.clone()))
+        room.receive(a, Frame::Update(update.clone()), None)
             .await
             .unwrap();
 
@@ -416,13 +522,13 @@ mod tests {
     async fn a_duplicate_is_acked_and_not_stored_again() {
         let store = Arc::new(MemoryStore::default());
         let room = room(&store, Limits::default()).await;
-        let (a, mut rx) = room.join(Role::Editor, hello(&[])).unwrap();
+        let (a, mut rx) = room.join(Role::Editor, hello(&[]), open()).unwrap();
         welcome(&mut rx);
         let update = edit(&LoroDoc::new(), "x");
-        room.receive(a, Frame::Update(update.clone()))
+        room.receive(a, Frame::Update(update.clone()), None)
             .await
             .unwrap();
-        room.receive(a, Frame::Update(update)).await.unwrap();
+        room.receive(a, Frame::Update(update), None).await.unwrap();
         assert_eq!(store.load("p").unwrap().log.len(), 1);
         assert!(matches!(*rx.try_recv().unwrap(), Frame::Ack(_)));
         assert!(matches!(*rx.try_recv().unwrap(), Frame::Ack(_)));
@@ -438,7 +544,7 @@ mod tests {
             room.apply(&edit(&doc, "two")).await.unwrap();
         }
         let room = room(&store, Limits::default()).await;
-        let (_p, mut rx) = room.join(Role::Viewer, hello(&[])).unwrap();
+        let (_p, mut rx) = room.join(Role::Viewer, hello(&[]), open()).unwrap();
         let (catch_up, _) = welcome(&mut rx);
         let client = LoroDoc::new();
         client.import(&catch_up).unwrap();
@@ -452,7 +558,7 @@ mod tests {
         let doc = LoroDoc::new();
         room.apply(&edit(&doc, "x")).await.unwrap();
         let (_p, mut rx) = room
-            .join(Role::Editor, hello(&doc.oplog_vv().encode()))
+            .join(Role::Editor, hello(&doc.oplog_vv().encode()), open())
             .unwrap();
         assert!(welcome(&mut rx).0.is_empty());
     }
@@ -522,9 +628,9 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let room = room(&store, Limits::default()).await;
         for role in [Role::Viewer, Role::Commenter] {
-            let (p, _rx) = room.join(role, hello(&[])).unwrap();
+            let (p, _rx) = room.join(role, hello(&[]), open()).unwrap();
             let err = room
-                .receive(p, Frame::Update(edit(&LoroDoc::new(), "x")))
+                .receive(p, Frame::Update(edit(&LoroDoc::new(), "x")), None)
                 .await
                 .unwrap_err();
             assert!(matches!(err, SyncError::Forbidden));
@@ -536,8 +642,12 @@ mod tests {
     async fn garbage_never_reaches_the_log() {
         let store = Arc::new(MemoryStore::default());
         let room = room(&store, Limits::default()).await;
-        let (p, _rx) = room.join(Role::Editor, hello(&[])).unwrap();
-        assert!(room.receive(p, Frame::Update(vec![1, 2, 3])).await.is_err());
+        let (p, _rx) = room.join(Role::Editor, hello(&[]), open()).unwrap();
+        assert!(
+            room.receive(p, Frame::Update(vec![1, 2, 3]), None)
+                .await
+                .is_err()
+        );
         assert!(store.load("p").unwrap().log.is_empty());
     }
 
@@ -551,6 +661,7 @@ mod tests {
                     protocol: PROTOCOL_VERSION + 1,
                     version: Vec::new(),
                 },
+                open(),
             )
             .unwrap_err();
         assert!(matches!(err, SyncError::Version { .. }));
@@ -564,7 +675,7 @@ mod tests {
             ..Limits::default()
         };
         let room = room(&store, limits).await;
-        let (_slow, mut rx) = room.join(Role::Editor, hello(&[])).unwrap();
+        let (_slow, mut rx) = room.join(Role::Editor, hello(&[]), open()).unwrap();
         let doc = LoroDoc::new();
         for word in ["a", "b", "c"] {
             room.apply(&edit(&doc, word)).await.unwrap();
@@ -577,11 +688,13 @@ mod tests {
     #[tokio::test]
     async fn presence_goes_to_the_others_only() {
         let room = room(&Arc::new(MemoryStore::default()), Limits::default()).await;
-        let (a, mut rx_a) = room.join(Role::Viewer, hello(&[])).unwrap();
-        let (_b, mut rx_b) = room.join(Role::Viewer, hello(&[])).unwrap();
+        let (a, mut rx_a) = room.join(Role::Viewer, hello(&[]), open()).unwrap();
+        let (_b, mut rx_b) = room.join(Role::Viewer, hello(&[]), open()).unwrap();
         welcome(&mut rx_a);
         welcome(&mut rx_b);
-        room.receive(a, Frame::Presence(vec![7])).await.unwrap();
+        room.receive(a, Frame::Presence(vec![7]), None)
+            .await
+            .unwrap();
         assert_eq!(*rx_b.try_recv().unwrap(), Frame::Presence(vec![7]));
         assert!(rx_a.try_recv().is_err());
     }
@@ -601,16 +714,17 @@ mod tests {
     async fn an_update_may_use_all_the_space_left() {
         let store = Arc::new(MemoryStore::default());
         let room = room(&store, Limits::default()).await;
-        let (a, mut rx) = room.join(Role::Editor, hello(&[])).unwrap();
+        let (a, mut rx) = room.join(Role::Editor, hello(&[]), open()).unwrap();
         welcome(&mut rx);
         let update = edit(&LoroDoc::new(), &noise(6 << 20));
         assert!(update.len() > 6 << 20);
-        room.fits(update.len()).unwrap();
-        room.receive(a, Frame::Update(update.clone()))
+        let held = room.reserve(update.len()).unwrap();
+        room.receive(a, Frame::Update(update.clone()), Some(held))
             .await
             .unwrap();
         assert!(matches!(*rx.try_recv().unwrap(), Frame::Ack(_)));
         assert_eq!(room.space(), (32 << 20) - update.len());
+        assert_eq!(room.stored(), update.len());
     }
 
     #[tokio::test]
@@ -626,10 +740,10 @@ mod tests {
             .unwrap();
         let left = room.space();
         assert!(left < 500 << 10, "{left}");
-        let err = room.fits(left + 1).unwrap_err();
+        let err = room.reserve(left + 1).err().unwrap();
         assert!(matches!(err, SyncError::ProjectFull { .. }), "{err:?}");
         assert_eq!(err.close_code(), crate::close::TOO_LARGE);
-        room.fits(left).unwrap();
+        drop(room.reserve(left).unwrap());
         // The room checks again when the update is whole.
         let err = room
             .apply(&edit(&LoroDoc::new(), &noise(600 << 10)))
@@ -637,5 +751,157 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SyncError::ProjectFull { .. }), "{err:?}");
         assert_eq!(store.load("p").unwrap().log.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unfinished_updates_hold_their_space_until_written_or_dropped() {
+        let store = Arc::new(MemoryStore::default());
+        let limits = Limits {
+            max_document: 1 << 20,
+            ..Limits::default()
+        };
+        let room = room(&store, limits).await;
+        let (a, mut rx) = room.join(Role::Editor, hello(&[]), open()).unwrap();
+        welcome(&mut rx);
+        let first = room.reserve(600 << 10).unwrap();
+        // Two Begins that each fit alone do not both fit.
+        let err = room.reserve(600 << 10).err().unwrap();
+        assert!(matches!(err, SyncError::ProjectFull { .. }), "{err:?}");
+        // Nor does a single-frame update that would take the held space.
+        let big = edit(&LoroDoc::new(), &noise(500 << 10));
+        let err = room
+            .receive(a, Frame::Update(big.clone()), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SyncError::ProjectFull { .. }), "{err:?}");
+        assert!(store.load("p").unwrap().log.is_empty());
+        // A dropped transfer gives its space back.
+        drop(first);
+        assert_eq!(room.space(), 1 << 20);
+        room.receive(a, Frame::Update(big.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(room.space(), (1 << 20) - big.len());
+        // A reservation larger than its update gives the rest back.
+        let held = room.reserve(room.space()).unwrap();
+        assert_eq!(room.space(), 0);
+        let small = edit(&LoroDoc::new(), "small");
+        room.receive(a, Frame::Update(small.clone()), Some(held))
+            .await
+            .unwrap();
+        assert_eq!(room.space(), (1 << 20) - big.len() - small.len());
+    }
+
+    /// A store whose append waits at a gate the test opens.
+    struct Gated {
+        inner: MemoryStore,
+        reached: std::sync::Barrier,
+        go: std::sync::Barrier,
+    }
+
+    impl RoomStore for Gated {
+        fn load(&self, project: &str) -> Result<Stored, String> {
+            self.inner.load(project)
+        }
+        fn append(
+            &self,
+            project: &str,
+            update: &[u8],
+            admit: &dyn Fn() -> bool,
+        ) -> Result<bool, String> {
+            self.reached.wait();
+            self.go.wait();
+            self.inner.append(project, update, admit)
+        }
+        fn compact(
+            &self,
+            project: &str,
+            covers: &VersionVector,
+            snapshot: &[u8],
+        ) -> Result<(), String> {
+            self.inner.compact(project, covers, snapshot)
+        }
+    }
+
+    #[tokio::test]
+    async fn access_that_ends_while_an_update_waits_to_be_written_stops_it() {
+        let store = Arc::new(Gated {
+            inner: MemoryStore::default(),
+            reached: std::sync::Barrier::new(2),
+            go: std::sync::Barrier::new(2),
+        });
+        let room = Arc::new(
+            Room::open("p", Arc::clone(&store), Limits::default())
+                .await
+                .unwrap(),
+        );
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admit: Admit = {
+            let allowed = Arc::clone(&allowed);
+            Arc::new(move || allowed.load(Ordering::SeqCst))
+        };
+        let (a, mut rx_a) = room.join(Role::Editor, hello(&[]), admit).unwrap();
+        let (_b, mut rx_b) = room.join(Role::Editor, hello(&[]), open()).unwrap();
+        welcome(&mut rx_a);
+        welcome(&mut rx_b);
+        let write = tokio::spawn({
+            let room = Arc::clone(&room);
+            async move {
+                room.receive(a, Frame::Update(edit(&LoroDoc::new(), "late")), None)
+                    .await
+            }
+        });
+        // The update has passed every check before the write and waits there.
+        let gate = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || gate.reached.wait())
+            .await
+            .unwrap();
+        allowed.store(false, Ordering::SeqCst);
+        let gate = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || gate.go.wait())
+            .await
+            .unwrap();
+        let err = write.await.unwrap().unwrap_err();
+        assert!(matches!(err, SyncError::Ended), "{err:?}");
+        assert!(store.inner.load("p").unwrap().log.is_empty());
+        assert!(
+            rx_b.try_recv().is_err(),
+            "the update reached another client"
+        );
+        assert!(rx_a.try_recv().is_err(), "the update was acked");
+        assert_eq!(room.space(), Limits::default().max_document);
+    }
+
+    /// The quota is checked to the byte, for an update in one frame and for
+    /// one that came in parts with its space reserved.
+    #[tokio::test]
+    async fn the_quota_holds_to_the_byte() {
+        let update = edit(&LoroDoc::new(), &noise(64 << 10));
+        for (max, fits) in [(update.len(), true), (update.len() - 1, false)] {
+            for parts in [false, true] {
+                let store = Arc::new(MemoryStore::default());
+                let limits = Limits {
+                    max_document: max,
+                    ..Limits::default()
+                };
+                let room = room(&store, limits).await;
+                let (a, mut rx) = room.join(Role::Editor, hello(&[]), open()).unwrap();
+                welcome(&mut rx);
+                let held = if parts {
+                    match room.reserve(update.len()) {
+                        Ok(held) => Some(held),
+                        Err(e) => {
+                            assert!(!fits, "{max} {parts}: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let got = room.receive(a, Frame::Update(update.clone()), held).await;
+                assert_eq!(got.is_ok(), fits, "{max} {parts}: {got:?}");
+                assert_eq!(room.space(), if fits { 0 } else { max });
+            }
+        }
     }
 }

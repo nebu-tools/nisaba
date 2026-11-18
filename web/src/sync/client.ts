@@ -172,7 +172,6 @@ export class SyncClient {
     ws.binaryType = "arraybuffer"
     this.ws = ws
     ws.onopen = () => {
-      this.retry = 0
       const version = this.doc.oplogVersion()
       this.send({ type: "hello", protocol: PROTOCOL, version: version.length() === 0 ? new Uint8Array() : version.encode() })
       this.heartbeat = setInterval(() => this.send({ type: "heartbeat" }), HEARTBEAT_MS)
@@ -215,7 +214,10 @@ export class SyncClient {
         this.acked = VersionVector.decode(frame.version)
         this.ready()
         const cmp = this.doc.oplogVersion().compare(this.acked)
-        if (cmp !== 0 && cmp !== -1) this.send({ type: "update", update: this.doc.export({ mode: "update", from: this.acked }) })
+        // Only a connection that got somewhere ends the backoff: one the
+        // server closes again (1013, 4008) waits longer each time.
+        if (cmp === 0 || cmp === -1) this.retry = 0
+        else this.send({ type: "update", update: this.doc.export({ mode: "update", from: this.acked }) })
         break
       }
       case "update":
@@ -224,6 +226,7 @@ export class SyncClient {
       case "ack":
         this.acked = VersionVector.decode(frame.version)
         this.malformed = 0
+        this.retry = 0
         break
       case "presence":
       case "heartbeat":

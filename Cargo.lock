@@ -2256,6 +2256,7 @@ dependencies = [
  "argon2",
  "axum",
  "base64",
+ "futures-channel",
  "futures-util",
  "landlock",
  "libc",

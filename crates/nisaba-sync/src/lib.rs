@@ -13,5 +13,5 @@ mod store;
 
 pub use error::{FrameError, SyncError};
 pub use protocol::{Assembler, Frame, PART, PROTOCOL_VERSION, UPDATE_HEADER, close, split};
-pub use room::{Limits, Peer, Role, Room};
+pub use room::{Admit, Limits, Peer, Reservation, Role, Room};
 pub use store::{MemoryStore, RoomStore, Stored};

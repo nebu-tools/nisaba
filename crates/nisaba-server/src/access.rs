@@ -129,6 +129,14 @@ impl Grant {
         (now_secs() >= self.expires_at).then_some(close::SIGNED_OUT)
     }
 
+    /// Whether the grant still holds, for the room to ask when it writes.
+    #[must_use]
+    pub fn admits(&self) -> nisaba_sync::Admit {
+        let ended = self.ended.clone();
+        let expires_at = self.expires_at;
+        std::sync::Arc::new(move || ended.borrow().is_none() && now_secs() < expires_at)
+    }
+
     /// A handle that waits for the end, apart from the grant itself.
     #[must_use]
     pub fn ending(&self) -> Ending {

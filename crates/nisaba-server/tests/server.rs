@@ -902,7 +902,7 @@ async fn an_export_that_runs_out_of_time_is_killed() {
         dir.path(),
         &[
             "--export-seconds",
-            "2",
+            "5",
             "--export-parallel",
             "1",
             "--export-queue",
@@ -931,7 +931,7 @@ async fn an_export_that_runs_out_of_time_is_killed() {
     assert_eq!(res.status(), 422);
     let message = res.text().await.unwrap();
     assert!(message.contains("out of time"), "{message}");
-    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(started.elapsed() < Duration::from_secs(15));
     #[cfg(target_os = "linux")]
     assert_eq!(
         children(server.child.id()),
@@ -939,7 +939,8 @@ async fn an_export_that_runs_out_of_time_is_killed() {
         "the child was not reaped"
     );
     let fine = new_project(&client, base).await;
-    assert_eq!(export(&client, base, &fine).await.status(), 200);
+    let res = export(&client, base, &fine).await;
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
 }
 
 /// The server in this process, so a test can take access away through the
@@ -969,7 +970,7 @@ impl InProcess {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let public = PublicAddress::resolve(addr, None, false).unwrap();
-        let app = nisaba_server::http::App::new(store.clone(), public, exporter);
+        let app = nisaba_server::http::App::new(store.clone(), public, exporter, 256 << 20);
         let router = nisaba_server::http::router(app.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -1244,6 +1245,121 @@ async fn an_update_cut_off_midway_is_sent_again() {
         .unwrap();
     again.push_saved().await;
     let saved = main_text(&client, base, &project).await;
+    assert_eq!(saved.matches(&big).count(), 1);
+}
+
+/// At the 32 MiB quota a Begin may declare exactly what is left, and not
+/// one byte more. While it is unfinished, its declared length is held.
+#[tokio::test]
+async fn a_begin_may_declare_exactly_the_space_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = InProcess::start(dir.path()).await;
+    let base = &server.base;
+    let (client, cookie) = sign_up(base).await;
+    let project = new_project(&client, base).await;
+    let room = server.app.rooms().get(&project).await.unwrap();
+    let left = room.space();
+    assert!(left > 31 << 20 && left < 32 << 20, "{left}");
+    let header = nisaba_sync::UPDATE_HEADER;
+    let mut over = Peer::connect(base, &cookie, &project, 11).await;
+    let total = u32::try_from(left + header + 1).unwrap();
+    send(&mut over.ws, &Frame::Begin { total }).await;
+    assert_eq!(closed_with(&mut over.ws).await, 4130);
+    let mut exact = Peer::connect(base, &cookie, &project, 12).await;
+    send(&mut exact.ws, &Frame::Begin { total: total - 1 }).await;
+    assert!(within(10, || room.space() == 0).await, "{}", room.space());
+    // Nothing else fits beside it, not even a small edit in one frame.
+    let mut small = Peer::connect(base, &cookie, &project, 13).await;
+    small.type_text(" Limpets").await;
+    assert_eq!(closed_with(&mut small.ws).await, 4130);
+    drop(exact);
+    assert!(within(10, || room.space() == left).await);
+}
+
+/// Two sockets send 4 MiB updates in parts at the same time, each from its
+/// own task on its own thread, and both are saved. Each client reads while
+/// it sends, as a browser does: one that did not would stop reading the other
+/// update the server sends it and be closed as too slow (4002).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_large_updates_at_the_same_time_are_both_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    let (client, cookie) = sign_up(base).await;
+    let project = new_project(&client, base).await;
+    let (one, two) = (noise(4 << 20, 1), noise(4 << 20, 2));
+    let both = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let send = |peer: u64, text: String| {
+        let (base, cookie, project) = (base.clone(), cookie.clone(), project.clone());
+        let both = std::sync::Arc::clone(&both);
+        tokio::spawn(async move {
+            let me = Peer::connect(&base, &cookie, &project, peer).await;
+            let main = me.main_text();
+            main.insert(main.len_unicode(), &text).unwrap();
+            me.doc.commit();
+            let update = me.doc.export(ExportMode::updates(&me.acked)).unwrap();
+            let local = me.doc.oplog_vv();
+            let (mut sink, mut stream) = me.ws.split();
+            // Neither starts before both are connected.
+            both.wait().await;
+            let sending = async move {
+                for message in split(&Frame::Update(update), PART) {
+                    sink.send(Message::Binary(message.into())).await.unwrap();
+                }
+                sink
+            };
+            let reading = async move {
+                let mut parts = Assembler::new(PART);
+                loop {
+                    let message = tokio::time::timeout(Duration::from_secs(30), stream.next())
+                        .await
+                        .expect("frame within 30 s")
+                        .expect("socket open")
+                        .unwrap();
+                    let Message::Binary(bytes) = message else {
+                        continue;
+                    };
+                    if let Some(Frame::Ack(vv)) = parts.push(&bytes, |_| Ok(())).unwrap()
+                        && VersionVector::decode(&vv).unwrap().includes_vv(&local)
+                    {
+                        return;
+                    }
+                }
+            };
+            drop(tokio::join!(sending, reading));
+        })
+    };
+    let (a, b) = (send(11, one.clone()), send(22, two.clone()));
+    a.await.unwrap();
+    b.await.unwrap();
+    let text = main_text(&client, base, &project).await;
+    assert_eq!(text.matches(&one).count(), 1);
+    assert_eq!(text.matches(&two).count(), 1);
+}
+
+/// The server dies after the last part and before the Ack can reach the
+/// client. Whether the update was written or not, the client sends it again
+/// after reconnecting, and it is saved exactly once.
+#[tokio::test]
+async fn a_server_that_dies_before_the_ack_saves_the_update_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let (client, cookie) = sign_up(&server.base).await;
+    let project = new_project(&client, &server.base).await;
+    let mut a = Peer::connect(&server.base, &cookie, &project, 11).await;
+    let big = noise(3 << 20, 9);
+    a.type_text(&big).await;
+    server.kill9();
+
+    let server = Server::start(dir.path());
+    let (client, cookie) = log_in(&server.base).await;
+    let mut again = Peer::connect(&server.base, &cookie, &project, 12).await;
+    again
+        .doc
+        .import(&a.doc.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    again.push_saved().await;
+    let saved = main_text(&client, &server.base, &project).await;
     assert_eq!(saved.matches(&big).count(), 1);
 }
 

@@ -37,6 +37,13 @@ pub enum SyncError {
     Full,
     #[error("the client did not read its frames in time")]
     TooSlow,
+    #[error("the update did not arrive in time; it will be sent again")]
+    TimedOut,
+    #[error("the server is busy with other large updates; try again later")]
+    Busy,
+    /// Access to the project ended before the update was written.
+    #[error("access to the project ended")]
+    Ended,
     #[error("not a Loro update: {0}")]
     Loro(String),
     #[error("storage: {0}")]
@@ -56,6 +63,9 @@ impl SyncError {
             Self::Forbidden => close::FORBIDDEN,
             Self::Full => close::FULL,
             Self::TooSlow => close::TOO_SLOW,
+            Self::TimedOut => close::TIMED_OUT,
+            Self::Busy => close::TRY_AGAIN,
+            Self::Ended => close::SIGNED_OUT,
             Self::Storage(_) => close::SERVER_ERROR,
         }
     }
