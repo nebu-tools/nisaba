@@ -1,12 +1,38 @@
-//! `nisaba --data DIR --listen ADDR`
+//! `nisaba [--data DIR] [--listen ADDR] [--public-url URL] ...`; see
+//! [`nisaba_server::config::USAGE`].
 
-use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use nisaba_server::{http, store::Store, sync::Rooms};
+use nisaba_server::config::{PublicAddress, Settings, USAGE};
+use nisaba_server::export::{self, Exporter};
+use nisaba_server::{http, store::Store};
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The export child: no runtime, no logging, nothing but the compile.
+    if args.first().map(String::as_str) == Some(export::SUBCOMMAND) {
+        std::process::exit(export::child_main(&args[1..]));
+    }
+    let settings = match Settings::parse(args) {
+        Ok(settings) => settings,
+        Err(e) => {
+            eprintln!("{e}\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(serve(settings));
+}
+
+fn exit(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1);
+}
+
+async fn serve(settings: Settings) {
     let started = Instant::now();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -14,46 +40,47 @@ async fn main() {
                 .unwrap_or_else(|_| "nisaba=info,nisaba_server=info".into()),
         )
         .init();
-    let mut data = PathBuf::from("nisaba-data");
-    let mut listen = String::from("127.0.0.1:8080");
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--data" => data = args.next().map(PathBuf::from).unwrap_or(data),
-            "--listen" => listen = args.next().unwrap_or(listen),
-            other => {
-                eprintln!("unknown argument {other}\nusage: nisaba [--data DIR] [--listen ADDR]");
-                std::process::exit(2);
-            }
-        }
-    }
-    let store = match Store::open(&data) {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("cannot open data directory {}: {e}", data.display());
-            std::process::exit(1);
-        }
-    };
-    let app = http::App {
-        rooms: Rooms::new(store.clone()),
-        store,
-    };
-    let listener = match tokio::net::TcpListener::bind(&listen).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("cannot listen on {listen}: {e}");
-            std::process::exit(1);
-        }
-    };
+    let store = Store::open(&settings.data).unwrap_or_else(|e| {
+        exit(&format!(
+            "cannot open data directory {}: {e}",
+            settings.data.display()
+        ))
+    });
+    let listener = tokio::net::TcpListener::bind(&settings.listen)
+        .await
+        .unwrap_or_else(|e| exit(&format!("cannot listen on {}: {e}", settings.listen)));
     let addr = listener
         .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or(listen);
-    // Tests and scripts read this line to find the port.
+        .unwrap_or_else(|e| exit(&e.to_string()));
+    let public = PublicAddress::resolve(
+        addr,
+        settings.public_url.as_deref(),
+        settings.allow_insecure_http,
+    )
+    .unwrap_or_else(|e| exit(&e));
+    // Setup needs no code only when nothing but this machine can reach the
+    // server: it listens on loopback and people use a loopback address.
+    let local_only = addr.ip().is_loopback() && public.is_loopback();
+    let setup_code = store
+        .prepare_setup(!local_only)
+        .unwrap_or_else(|e| exit(&e));
+    let exporter = Exporter::new(Exporter::this_binary(), settings.export.clone());
+    let app = http::App::new(store, public.clone(), exporter);
+    app.rooms().spawn_sweeper(Duration::from_secs(60));
+    // Tests and scripts read these lines: the port, the setup code, and the
+    // public address, which always comes last.
     println!(
         "listening on http://{addr} ({} ms)",
         started.elapsed().as_millis()
     );
+    if let Some(code) = setup_code {
+        println!(
+            "setup code {code}\n  Open {} and enter this code to create the owner account. \
+             It works once; a restart before setup makes a new one.",
+            public.origin()
+        );
+    }
+    println!("public address {}", public.origin());
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -61,7 +88,6 @@ async fn main() {
         .with_graceful_shutdown(shutdown)
         .await
     {
-        eprintln!("server stopped: {e}");
-        std::process::exit(1);
+        exit(&format!("server stopped: {e}"));
     }
 }

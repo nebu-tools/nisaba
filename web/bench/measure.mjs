@@ -57,7 +57,7 @@ try {
   }
 
   const context = await browser.newContext({ storageState: join(data, "state.json"), viewport: { width: 1600, height: 1000 }, deviceScaleFactor: Number(process.env.DPR ?? 1) })
-  const created = await context.request.post(`${base}/api/projects`, { data: fixture })
+  const created = await context.request.post(`${base}/api/projects`, { data: fixture, headers: { origin: base } })
   const { id } = await created.json()
 
   // First preview of the 30-page fixture, from a cold browser cache.
@@ -126,7 +126,7 @@ try {
 
   // Server export from the same room state.
   const exportAt = performance.now()
-  const pdf = await context.request.get(`${base}/api/projects/${id}/export.pdf`)
+  const pdf = await context.request.get(`${base}/api/projects/${id}/export.pdf?today=${new Date().toLocaleDateString("sv")}`)
   results.exportStatus = pdf.status()
   results.exportMs = round(performance.now() - exportAt)
   results.exportBytes = (await pdf.body()).length

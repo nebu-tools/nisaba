@@ -54,6 +54,29 @@ impl Rooms {
         Ok(room)
     }
 
+    /// Closes every room that no socket and no request holds, so memory
+    /// follows the projects in use rather than every project ever opened.
+    /// The room's state is already on disk.
+    #[must_use]
+    pub fn sweep(&self) -> usize {
+        let mut open = self.open.lock().expect("rooms lock");
+        let before = open.len();
+        open.retain(|_, room| Arc::strong_count(room) > 1);
+        before - open.len()
+    }
+
+    /// Sweeps every `every`.
+    pub fn spawn_sweeper(&self, every: Duration) {
+        let rooms = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            loop {
+                tick.tick().await;
+                let _closed = rooms.sweep();
+            }
+        });
+    }
+
     fn cached(&self, project: &str) -> Option<Arc<ProjectRoom>> {
         self.open.lock().expect("rooms lock").get(project).cloned()
     }

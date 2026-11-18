@@ -11,11 +11,11 @@ Nisaba is a self-hosted editor in which several people write one Typst document 
 Nisaba is not ready for use. This much runs today:
 
 - One server program, `nisaba`, that keeps its data in one directory: an SQLite database and the asset files.
-- First-run setup of an owner account, sign-in with email and password, and sign-out.
+- First-run setup of an owner account, protected by a one-time setup code when the server can be reached from other machines; sign-in with email and password, and sign-out.
 - A project list. You can create a project and open it.
 - Live editing of the project's files by several people at once, with sync over a WebSocket and a copy of unsent changes kept in the browser.
 - A preview that compiles in the browser and draws each page on a canvas.
-- PDF export from the server.
+- PDF export from the server, in a child process with memory, time and parallel limits; on Linux it also has no file or network access.
 
 This does not exist yet:
 
@@ -41,6 +41,16 @@ cargo run --release -p nisaba-server -- --data ./data --listen 127.0.0.1:8080
 ```
 
 Open http://127.0.0.1:8080 and create the owner account. The server embeds the web client, so build the client before the server.
+
+To serve other machines, put a TLS reverse proxy in front of the server and tell the server the address people use:
+
+```sh
+cargo run --release -p nisaba-server -- --data ./data --listen 0.0.0.0:8080 --public-url https://nisaba.example.org
+```
+
+The server then prints a setup code to its log at start; the setup screen asks for it. It refuses a plain-http public address that is not loopback unless you pass `--allow-insecure-http`.
+
+Exports are limited by `--export-memory-mb` (default 1024), `--export-seconds` (60), `--export-parallel` (2) and `--export-queue` (8). DESIGN.md section 8 says what each does.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) lists the checks.
 

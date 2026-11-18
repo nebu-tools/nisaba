@@ -28,3 +28,5 @@ export type FromWorker =
   | ({ type: "layout"; id: number; changed: number[] } & Compiled)
   | { type: "page"; index: number; bitmap: ImageBitmap }
   | { type: "done"; id: number; compileMs: number; renderMs: number; rendered: number; changed: number }
+  /** The worker cannot go on: it could not start, a font did not load, or the compiler failed. */
+  | { type: "failed"; message: string }

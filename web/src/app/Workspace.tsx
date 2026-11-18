@@ -5,6 +5,7 @@
  */
 import { For, Show, createSignal, onCleanup, onMount, type JSX } from "solid-js"
 import { Editor } from "../editor/editor"
+import { exportUrl } from "./api"
 import type { Problem } from "../preview/messages"
 import { Preview } from "../preview/preview"
 import { SyncClient, type SaveState } from "../sync/client"
@@ -25,6 +26,8 @@ export function Workspace(props: { project: string }): JSX.Element {
   const [files, setFiles] = createSignal<ProjectFile[]>([])
   const [current, setCurrent] = createSignal("main.typ")
   const [problems, setProblems] = createSignal<Problem[] | undefined>()
+  const [previewError, setPreviewError] = createSignal<string | undefined>()
+  const [retryPreview, setRetryPreview] = createSignal<() => void>(() => {})
   const [openFile, setOpen] = createSignal<(path: string) => void>(() => {})
   let editorEl!: HTMLElement
   let previewEl!: HTMLElement
@@ -39,7 +42,14 @@ export function Workspace(props: { project: string }): JSX.Element {
     await sync.start()
     await sync.loaded
     const editor = new Editor(editorEl, sync.doc)
-    const preview = new Preview(previewEl, sync.doc, { problems: setProblems }, opened)
+    const preview = new Preview(
+      previewEl,
+      sync.doc,
+      props.project,
+      { problems: setProblems, failed: setPreviewError },
+      opened,
+    )
+    setRetryPreview(() => () => preview.retry())
     const open = (path: string): void => {
       const text = projectFiles(sync.doc).find((f) => f.path === path)?.text
       if (!text) return
@@ -75,6 +85,10 @@ export function Workspace(props: { project: string }): JSX.Element {
     <div class="shell">
       <header>
         <a href="/">Projects</a>
+        {/* The link is built when clicked, so the date is today's. */}
+        <a href={exportUrl(props.project)} onClick={(e) => (e.currentTarget.href = exportUrl(props.project))}>
+          Export PDF
+        </a>
         <span id="status" role="status" data-state={state().state}>
           {state().note ? `${STATUS[state().state]} (${state().note})` : STATUS[state().state]}
         </span>
@@ -94,6 +108,13 @@ export function Workspace(props: { project: string }): JSX.Element {
       </nav>
       <section id="editor" ref={(el) => (editorEl = el)} />
       <section id="preview" aria-label="Preview" ref={(el) => (previewEl = el)}>
+        <Show when={previewError()}>
+          {(message) => (
+            <p class="note" role="alert">
+              {message()} It retries by itself. <button onClick={() => retryPreview()()}>Retry now</button>
+            </p>
+          )}
+        </Show>
         <Show when={problems()} fallback={<p class="empty note">Preparing preview…</p>}>
           <Show when={errors()}>
             <p class="note">{errors()}</p>

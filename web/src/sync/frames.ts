@@ -28,9 +28,11 @@ export const Close = {
   malformed: 4000,
   tooSlow: 4002,
   forbidden: 4003,
+  notFound: 4004,
   full: 4029,
   tooLarge: 4130,
   version: 4400,
+  signedOut: 4401,
   serverError: 4500,
 } as const
 

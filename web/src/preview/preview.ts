@@ -1,56 +1,96 @@
 /**
  * The page view: a column of page canvases fed by the preview worker.
  *
- * Rules (DESIGN.md section 8): the preview never shows a PDF, at most one
- * compile is in flight, and a failed compile shows its problems next to the
- * last good pages, never a server compile in their place.
+ * Rules (DESIGN.md section 8): the preview never shows a PDF, and a failed
+ * compile shows its problems next to the last good pages, never a server
+ * compile in their place. What is sent to the worker and when is decided by
+ * `Feed` (feed.ts); this class owns the worker, the DOM and the metrics.
  */
 import type { LoroDoc } from "loro-crdt"
 import { metrics } from "../app/metrics"
-import { projectFiles } from "../sync/files"
+import { fetchOk } from "./apply"
+import { Feed, fileStates } from "./feed"
 import type { FromWorker, Problem, ToWorker } from "./messages"
 
 export interface PreviewEvents {
   /** The problems of the newest compile. */
   problems(problems: Problem[]): void
+  /** The preview failed and retries by itself, or it recovered (`undefined`). */
+  failed(message: string | undefined): void
 }
 
 export class Preview {
-  private readonly worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
-  private readonly sent = new Map<string, string>()
-  private readonly assets = new Map<string, Uint8Array>()
+  private worker: Worker | undefined
+  private readonly feed: Feed
   private readonly pages: HTMLDivElement[] = []
   private readonly visible = new Set<number>()
   private readonly stale = new Set<number>()
   private readonly observer: IntersectionObserver
-  private inFlight = false
-  private dirty = false
-  private id = 0
+  private readonly online = (): void => this.feed.retry()
   private typedAt = 0
   private sentAt = 0
 
   constructor(
     private readonly pane: HTMLElement,
     private readonly doc: LoroDoc,
+    project: string,
     private readonly events: PreviewEvents,
     private readonly opened = performance.now(),
   ) {
     this.observer = new IntersectionObserver((entries) => this.seen(entries), { root: pane, rootMargin: "100% 0px" })
-    this.worker.onmessage = (event: MessageEvent<FromWorker>) => this.receive(event.data)
+    this.feed = new Feed({
+      files: () => fileStates(this.doc),
+      post: (msg) => this.post(msg),
+      restart: () => this.start(),
+      fetchAsset: async (hash) =>
+        new Uint8Array(await (await fetchOk(`/api/projects/${project}/assets/${hash}`)).arrayBuffer()),
+      view: () => ({ visible: [...this.visible], scale: this.scale() }),
+      failed: (message) => this.events.failed(message),
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout> | undefined),
+    })
+    this.start()
+    window.addEventListener("online", this.online)
   }
 
   /** Call after any change to the document. */
   changed(): void {
-    this.compile()
+    this.feed.changed()
+  }
+
+  /** Retries at once after a failure. */
+  retry(): void {
+    this.feed.retry()
   }
 
   destroy(): void {
-    this.worker.terminate()
+    this.feed.stop()
+    this.worker?.terminate()
     this.observer.disconnect()
+    window.removeEventListener("online", this.online)
+  }
+
+  /** Starts a fresh worker in place of the current one. */
+  private start(): void {
+    this.worker?.terminate()
+    const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
+    worker.onmessage = (event: MessageEvent<FromWorker>) => this.receive(event.data)
+    worker.onerror = (event) => {
+      event.preventDefault()
+      this.feed.workerFailed(event.message || "the worker crashed")
+    }
+    worker.onmessageerror = () => this.feed.workerFailed("a message from the worker could not be read")
+    this.worker = worker
+    // The new worker has drawn nothing yet.
+    for (let i = 0; i < this.pages.length; i++) this.stale.add(i)
   }
 
   private post(msg: ToWorker): void {
-    this.worker.postMessage(msg)
+    if (msg.type === "compile") {
+      this.typedAt = metrics.typedAt
+      this.sentAt = performance.now()
+    }
+    this.worker?.postMessage(msg)
   }
 
   /** Device pixels per Typst point at the pane's width (A4 is 595 pt wide). */
@@ -68,48 +108,10 @@ export class Preview {
     }
   }
 
-  private compile(): void {
-    if (this.inFlight) {
-      this.dirty = true
-      return
-    }
-    this.dirty = false
-    for (const file of projectFiles(this.doc)) {
-      if (file.text) {
-        const text = file.text.toString()
-        if (this.sent.get(file.path) !== text) {
-          this.sent.set(file.path, text)
-          this.post({ type: "text", path: file.path, text })
-        }
-      } else if (file.hash && this.sent.get(file.path) !== file.hash) {
-        const { path, hash } = file
-        this.sent.set(path, hash)
-        const cached = this.assets.get(hash)
-        if (cached) {
-          this.post({ type: "bytes", path, bytes: cached })
-          continue
-        }
-        this.inFlight = true
-        void fetch(`/api/assets/${hash}`)
-          .then((r) => r.arrayBuffer())
-          .then((b) => {
-            const bytes = new Uint8Array(b)
-            this.assets.set(hash, bytes)
-            this.post({ type: "bytes", path, bytes })
-            this.inFlight = false
-            this.compile()
-          })
-        return
-      }
-    }
-    this.inFlight = true
-    this.typedAt = metrics.typedAt
-    this.sentAt = performance.now()
-    this.post({ type: "compile", id: ++this.id, visible: [...this.visible], scale: this.scale() })
-  }
-
   private receive(msg: FromWorker): void {
-    if (msg.type === "layout") {
+    if (msg.type === "failed") {
+      this.feed.workerFailed(msg.message)
+    } else if (msg.type === "layout") {
       this.events.problems(msg.problems)
       while (this.pages.length < msg.sizes.length) {
         const div = document.createElement("div")
@@ -164,8 +166,7 @@ export class Preview {
           })
         }
       })
-      this.inFlight = false
-      if (this.dirty) this.compile()
+      this.feed.done(msg.id)
     }
   }
 }

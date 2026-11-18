@@ -10,7 +10,7 @@ description = "Project rooms and the sync wire protocol for Nisaba."
 workspace = true
 
 [dependencies]
-loro = "1.13"
+loro = "1.18"
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt"] }
 tracing = "0.1"

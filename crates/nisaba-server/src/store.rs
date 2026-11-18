@@ -2,7 +2,8 @@
 //!
 //! A data directory holds `nisaba.db` (an `SQLite` database in WAL mode) and `assets/`
 //! (content-addressed files). The database holds accounts, sessions, projects,
-//! memberships, and each project's Loro update log and latest snapshot.
+//! memberships, which assets each project holds, the first-run setup code,
+//! and each project's Loro update log and latest snapshot.
 //!
 //! The update log is written first: an update is committed with
 //! `synchronous = FULL` before the server acknowledges it, so an acknowledged
@@ -58,7 +59,29 @@ CREATE TABLE IF NOT EXISTS assets (
   hash TEXT PRIMARY KEY,
   size INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS project_assets (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  hash TEXT NOT NULL REFERENCES assets(hash),
+  PRIMARY KEY (project_id, hash)
+);
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value BLOB NOT NULL
+);
 ";
+
+/// The `settings` key of the SHA-256 of the first-run setup code.
+const SETUP_CODE: &str = "setup_code_sha256";
+
+/// What [`Store::create_owner`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Setup {
+    Created,
+    /// An account exists already.
+    Taken,
+    /// A setup code is required and this one is missing or wrong.
+    WrongCode,
+}
 
 /// The data directory: one `SQLite` database and a folder of assets.
 #[derive(Clone)]
@@ -102,13 +125,91 @@ impl Store {
         self.with(|c| c.query_row("SELECT count(*) FROM users", [], |r| r.get(0)))
     }
 
+    /// Adds an account. Only for setting up a data directory in tests and
+    /// tools; the server itself creates its one account with
+    /// [`Store::create_owner`].
     pub fn create_user(&self, id: &str, email: &str, name: &str, hash: &str) -> Result<(), String> {
+        self.with(|c| insert_user(c, id, email, name, hash))
+    }
+
+    /// Creates the first account, in one write transaction that also checks
+    /// that no account exists and, when a setup code is stored, that `code`
+    /// matches it. The code is compared in constant time and deleted with the
+    /// same commit, so it works once.
+    pub fn create_owner(
+        &self,
+        user: &User,
+        password_hash: &str,
+        code: Option<&str>,
+    ) -> Result<Setup, String> {
         self.with(|c| {
-            c.execute(
-                "INSERT INTO users (id, email, name, password_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, email, name, hash, now_secs()],
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let users: i64 = tx.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
+            if users > 0 {
+                return Ok(Setup::Taken);
+            }
+            let stored: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    [SETUP_CODE],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(stored) = stored {
+                use subtle::ConstantTimeEq as _;
+                let given = Sha256::digest(normalize_code(code.unwrap_or("")).as_bytes());
+                if !bool::from(given.as_slice().ct_eq(&stored)) {
+                    return Ok(Setup::WrongCode);
+                }
+            }
+            insert_user(&tx, &user.id, &user.email, &user.name, password_hash)?;
+            tx.execute("DELETE FROM settings WHERE key = ?1", [SETUP_CODE])?;
+            tx.commit()?;
+            Ok(Setup::Created)
+        })
+    }
+
+    /// Prepares first-run setup at start. While no account exists and
+    /// `needed` is true, makes a new setup code, keeps only its SHA-256 and
+    /// returns the code, replacing any code of an earlier start. Otherwise
+    /// drops any stored code and returns `None`.
+    pub fn prepare_setup(&self, needed: bool) -> Result<Option<String>, String> {
+        let raw: [u8; 16] = rand::random();
+        let code = hex(&raw)
+            .as_bytes()
+            .chunks(4)
+            .map(|c| std::str::from_utf8(c).expect("hex is ASCII"))
+            .collect::<Vec<_>>()
+            .join("-");
+        let hash = Sha256::digest(normalize_code(&code).as_bytes()).to_vec();
+        self.with(|c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let users: i64 = tx.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
+            tx.execute("DELETE FROM settings WHERE key = ?1", [SETUP_CODE])?;
+            let code = if users == 0 && needed {
+                tx.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)",
+                    params![SETUP_CODE, hash],
+                )?;
+                Some(code)
+            } else {
+                None
+            };
+            tx.commit()?;
+            Ok(code)
+        })
+    }
+
+    /// Whether first-run setup asks for a code.
+    pub fn setup_code_needed(&self) -> Result<bool, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT 1 FROM settings WHERE key = ?1",
+                [SETUP_CODE],
+                |_| Ok(()),
             )
-            .map(drop)
+            .optional()
+            .map(|row| row.is_some())
         })
     }
 
@@ -132,12 +233,15 @@ impl Store {
         })
     }
 
+    /// Adds a session and drops every expired one.
     pub fn create_session(&self, token: &str, user_id: &str, ttl_secs: i64) -> Result<(), String> {
         let hash = Sha256::digest(token.as_bytes()).to_vec();
         self.with(|c| {
+            let now = now_secs();
+            c.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])?;
             c.execute(
                 "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?1, ?2, ?3)",
-                params![hash, user_id, now_secs() + ttl_secs],
+                params![hash, user_id, now + ttl_secs],
             )
             .map(drop)
         })
@@ -213,15 +317,16 @@ impl Store {
         })
     }
 
-    /// Stores an asset under its SHA-256 and returns the hash. The file is
-    /// written and synced before its row is committed.
-    pub fn put_asset(&self, bytes: &[u8]) -> Result<String, String> {
+    /// Stores an asset under its SHA-256, records that `project` holds it,
+    /// and returns the hash. The file is written and synced before its rows
+    /// are committed.
+    pub fn put_asset(&self, project: &str, bytes: &[u8]) -> Result<String, String> {
         let hash = hex(&Sha256::digest(bytes));
         let path = self.asset_path(&hash);
         if !path.exists() {
             std::fs::create_dir_all(path.parent().expect("asset path has a parent"))
                 .map_err(|e| e.to_string())?;
-            let tmp = path.with_extension("tmp");
+            let tmp = path.with_extension(format!("{:016x}.tmp", rand::random::<u64>()));
             {
                 use std::io::Write as _;
                 let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
@@ -232,21 +337,36 @@ impl Store {
         }
         let size = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
         self.with(|c| {
-            c.execute(
+            let tx = c.transaction()?;
+            tx.execute(
                 "INSERT OR IGNORE INTO assets (hash, size) VALUES (?1, ?2)",
                 params![hash, size],
-            )
-            .map(drop)
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO project_assets (project_id, hash) VALUES (?1, ?2)",
+                params![project, hash],
+            )?;
+            tx.commit()
         })?;
         Ok(hash)
     }
 
-    #[must_use]
-    pub fn get_asset(&self, hash: &str) -> Option<Vec<u8>> {
+    /// The bytes of an asset, if `project` holds it. A project holds an
+    /// asset only when the bytes were uploaded to that project, so knowing a
+    /// hash from elsewhere gives no access to it.
+    pub fn project_asset(&self, project: &str, hash: &str) -> Result<Option<Vec<u8>>, String> {
         if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
+            return Ok(None);
         }
-        std::fs::read(self.asset_path(hash)).ok()
+        let held = self.with(|c| {
+            c.query_row(
+                "SELECT 1 FROM project_assets WHERE project_id = ?1 AND hash = ?2",
+                params![project, hash],
+                |_| Ok(()),
+            )
+            .optional()
+        })?;
+        Ok(held.and_then(|()| std::fs::read(self.asset_path(hash)).ok()))
     }
 
     fn asset_path(&self, hash: &str) -> PathBuf {
@@ -263,6 +383,29 @@ impl Store {
             )
         })
     }
+}
+
+fn insert_user(
+    c: &Connection,
+    id: &str,
+    email: &str,
+    name: &str,
+    hash: &str,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO users (id, email, name, password_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, email, name, hash, now_secs()],
+    )
+    .map(drop)
+}
+
+/// A setup code as typed: hex digits only, lower case. People may copy it
+/// with or without the dashes and in either case.
+fn normalize_code(code: &str) -> String {
+    code.chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {

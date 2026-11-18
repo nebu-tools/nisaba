@@ -51,6 +51,10 @@ pub struct Limits {
     pub compact_entries: usize,
     /// ...or this many log bytes, whichever comes first.
     pub compact_bytes: usize,
+    /// The stored size of a project, its snapshot plus its log, past which
+    /// the room refuses updates. Kept below `max_catch_up` so a full project
+    /// still fits in one catch-up.
+    pub max_document: usize,
 }
 
 impl Default for Limits {
@@ -62,6 +66,7 @@ impl Default for Limits {
             queue: 1024,
             compact_entries: 500,
             compact_bytes: 8 << 20,
+            max_document: 32 << 20,
         }
     }
 }
@@ -76,10 +81,11 @@ struct State {
     sessions: HashMap<Peer, Session>,
 }
 
-/// The log size since the last snapshot.
+/// The log size since the last snapshot, and the snapshot's size.
 struct Log {
     entries: usize,
     bytes: usize,
+    snapshot: usize,
 }
 
 pub struct Room<S> {
@@ -111,6 +117,7 @@ impl<S: RoomStore> Room<S> {
             write: tokio::sync::Mutex::new(Log {
                 entries: stored.log.len(),
                 bytes: stored.log.iter().map(Vec::len).sum(),
+                snapshot: stored.snapshot.as_ref().map_or(0, Vec::len),
             }),
             state: Mutex::new(State {
                 doc,
@@ -236,6 +243,10 @@ impl<S: RoomStore> Room<S> {
         if self.lock().doc.oplog_vv().includes_vv(&meta.partial_end_vv) {
             return Ok(self.lock().doc.oplog_vv().encode());
         }
+        let stored = log.snapshot + log.bytes + update.len();
+        if stored > self.limits.max_document {
+            return Err(SyncError::TooLarge(stored));
+        }
         let bytes = update.to_vec();
         blocking(&self.store, &self.project, move |s, p| s.append(p, &bytes)).await?;
         log.entries += 1;
@@ -253,6 +264,7 @@ impl<S: RoomStore> Room<S> {
                 let st = self.lock();
                 (st.doc.oplog_vv(), st.doc.export(ExportMode::Snapshot)?)
             };
+            let snapshot_len = snapshot.len();
             match blocking(&self.store, &self.project, move |s, p| {
                 s.compact(p, &covers, &snapshot)
             })
@@ -262,6 +274,7 @@ impl<S: RoomStore> Room<S> {
                     *log = Log {
                         entries: 0,
                         bytes: 0,
+                        snapshot: snapshot_len,
                     }
                 }
                 // The log still holds everything, so a failed compaction loses
@@ -432,6 +445,45 @@ mod tests {
         assert_eq!(log.len(), 1);
         let room = room(&store, limits).await;
         assert_eq!(room.read(|d| d.get_text("main").to_string()), "abcd");
+    }
+
+    #[tokio::test]
+    async fn a_project_stops_growing_at_its_limit() {
+        let store = Arc::new(MemoryStore::default());
+        let limits = Limits {
+            max_document: 4096,
+            compact_entries: 2,
+            ..Limits::default()
+        };
+        let doc = LoroDoc::new();
+        // Text that does not compress, so snapshots stay as large as the edits.
+        let mut seed = 1u32;
+        let mut page = || -> String {
+            (0..1000)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    char::from(b'a' + u8::try_from((seed >> 16) % 26).unwrap())
+                })
+                .collect()
+        };
+        let refused = {
+            let room = room(&store, limits.clone()).await;
+            let mut refused = None;
+            for _ in 0..10 {
+                if let Err(e) = room.apply(&edit(&doc, &page())).await {
+                    refused = Some(e);
+                    break;
+                }
+            }
+            refused
+        };
+        assert!(
+            matches!(refused, Some(SyncError::TooLarge(_))),
+            "{refused:?}"
+        );
+        // The limit counts what is stored, so it holds after a reopen too.
+        let room = room(&store, limits).await;
+        assert!(room.apply(&edit(&doc, &page())).await.is_err());
     }
 
     #[tokio::test]

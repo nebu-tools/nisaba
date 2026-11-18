@@ -11,7 +11,10 @@ use ts_rs::TS;
 /// `GET /api/session`.
 #[derive(Debug, Serialize, TS)]
 pub struct Session {
+    /// No account exists yet.
     pub setup_needed: bool,
+    /// Setup asks for the code the server printed to its log.
+    pub setup_code_needed: bool,
     pub user: Option<User>,
 }
 
@@ -23,13 +26,25 @@ pub struct User {
     pub name: String,
 }
 
-/// `POST /api/setup` and `POST /api/login`. Login ignores `name`.
+/// `POST /api/setup`: the first account.
 #[derive(Debug, Deserialize, TS)]
-pub struct Credentials {
+pub struct SetupRequest {
     pub email: String,
     pub password: String,
     #[serde(default)]
     pub name: String,
+    /// The code from the server log; needed unless the server is reachable
+    /// only from this machine.
+    #[serde(default)]
+    #[ts(optional)]
+    pub setup_code: Option<String>,
+}
+
+/// `POST /api/login`.
+#[derive(Debug, Deserialize, TS)]
+pub struct Credentials {
+    pub email: String,
+    pub password: String,
 }
 
 /// A project as the project list shows it.
@@ -91,6 +106,7 @@ pub fn typescript() -> String {
     let decls = [
         Session::decl(&cfg),
         User::decl(&cfg),
+        SetupRequest::decl(&cfg),
         Credentials::decl(&cfg),
         ProjectRow::decl(&cfg),
         NewProject::decl(&cfg),

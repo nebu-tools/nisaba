@@ -12,26 +12,29 @@
  *
  * Pages are rasterised here and sent as ImageBitmaps, which cost the main
  * thread almost nothing to draw.
+ *
+ * The worker does not retry. When it cannot start, a font does not load or
+ * the compiler throws, it says `failed` and the page replaces it with a fresh
+ * worker (see feed.ts).
  */
 import init, { JsLiveCompiler } from "../wasm-generated/nisaba_compile_wasm.js"
+import { applyFile, fetchOk, setLocalToday } from "./apply"
 import type { Compiled, FromWorker, ToWorker } from "./messages"
 
 interface FontEntry {
   file: string
 }
 
-let compiler: JsLiveCompiler | undefined
 let catalogue: FontEntry[] = []
-const ready = (async () => {
-  const [, fonts] = await Promise.all([init(), fetch("/fonts/fonts.json").then((r) => r.text())])
+const ready: Promise<JsLiveCompiler> = (async () => {
+  const [, fonts] = await Promise.all([init(), fetchOk("/fonts/fonts.json").then((r) => r.text())])
   catalogue = JSON.parse(fonts) as FontEntry[]
-  compiler = new JsLiveCompiler("main.typ", fonts)
-  const today = new Date()
-  compiler.set_today(today.getFullYear(), today.getMonth() + 1, today.getDate())
+  return new JsLiveCompiler("main.typ", fonts)
 })()
 let shown: string[] = []
 let queue: ToWorker[] = []
 let running = false
+let broken = false
 
 const post = (msg: FromWorker, transfer: Transferable[] = []): void => self.postMessage(msg, { transfer })
 
@@ -41,40 +44,45 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
 }
 
 async function drain(): Promise<void> {
-  if (running) return
+  if (running || broken) return
   running = true
-  await ready
-  while (queue.length > 0) {
-    // Apply every pending write, then compile once for the newest request.
-    const batch = queue
-    queue = []
-    let compile: Extract<ToWorker, { type: "compile" }> | undefined
-    for (const msg of batch) {
-      if (msg.type === "text") compiler!.write_text(msg.path, msg.text)
-      else if (msg.type === "bytes") compiler!.write_bytes(msg.path, msg.bytes)
-      else if (msg.type === "remove") compiler!.remove(msg.path)
-      else if (msg.type === "compile") compile = msg
-      else await render(msg.index, msg.scale)
+  try {
+    const compiler = await ready
+    while (queue.length > 0) {
+      // Apply every pending write, then compile once for the newest request.
+      const batch = queue
+      queue = []
+      let compile: Extract<ToWorker, { type: "compile" }> | undefined
+      for (const msg of batch) {
+        if (msg.type === "compile") compile = msg
+        else if (msg.type === "render") await render(compiler, msg.index, msg.scale)
+        else applyFile(compiler, msg)
+      }
+      if (compile) await run(compiler, compile)
     }
-    if (compile) await run(compile)
+  } catch (error) {
+    broken = true
+    post({ type: "failed", message: error instanceof Error ? error.message : String(error) })
+  } finally {
+    running = false
   }
-  running = false
 }
 
 /** Compiles until every font the document asks for is loaded. */
-async function compileWithFonts(): Promise<Compiled> {
+async function compileWithFonts(compiler: JsLiveCompiler): Promise<Compiled> {
   for (;;) {
-    const result = JSON.parse(compiler!.compile()) as Compiled
+    setLocalToday(compiler)
+    const result = JSON.parse(compiler.compile()) as Compiled
     if (result.missing_fonts.length === 0) return result
     const files = await Promise.all(
-      result.missing_fonts.map((i) => fetch(`/fonts/${catalogue[i]!.file}`).then((r) => r.arrayBuffer())),
+      result.missing_fonts.map((i) => fetchOk(`/fonts/${catalogue[i]!.file}`).then((r) => r.arrayBuffer())),
     )
-    result.missing_fonts.forEach((index, n) => compiler!.add_font(index, new Uint8Array(files[n]!)))
+    result.missing_fonts.forEach((index, n) => compiler.add_font(index, new Uint8Array(files[n]!)))
   }
 }
 
-async function render(index: number, scale: number): Promise<void> {
-  const raw = compiler!.page_rgba(index, scale)
+async function render(compiler: JsLiveCompiler, index: number, scale: number): Promise<void> {
+  const raw = compiler.page_rgba(index, scale)
   if (!raw) return
   const view = new DataView(raw.buffer, raw.byteOffset, 8)
   const width = view.getUint32(0, true)
@@ -84,9 +92,9 @@ async function render(index: number, scale: number): Promise<void> {
   post({ type: "page", index, bitmap }, [bitmap])
 }
 
-async function run(msg: Extract<ToWorker, { type: "compile" }>): Promise<void> {
+async function run(compiler: JsLiveCompiler, msg: Extract<ToWorker, { type: "compile" }>): Promise<void> {
   const t0 = performance.now()
-  const result = await compileWithFonts()
+  const result = await compileWithFonts(compiler)
   const compileMs = performance.now() - t0
   const changed = result.pages.flatMap((fp, i) => (fp === shown[i] ? [] : [i]))
   shown = result.pages
@@ -96,7 +104,7 @@ async function run(msg: Extract<ToWorker, { type: "compile" }>): Promise<void> {
   let rendered = 0
   for (const i of changed) {
     if (visible.has(i) || (visible.size === 0 && i < 3)) {
-      await render(i, msg.scale)
+      await render(compiler, i, msg.scale)
       rendered++
     }
   }

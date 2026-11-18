@@ -97,14 +97,16 @@ and plain files are easy to copy, deduplicate and check.
 |---|---|
 | `users` | id, email, display name, Argon2id password hash (nullable for OIDC-only users), `is_admin`, created time |
 | `identities` | OIDC issuer and subject linked to a user |
-| `sessions` | SHA-256 of the session token, user, expiry, last use |
+| `sessions` | SHA-256 of the session token, user, expiry |
 | `invitations` | SHA-256 of the invitation token, project, role, creator, expiry, used time |
 | `projects` | id, name, entrypoint path, epoch, created and updated time |
 | `members` | project, user, role (`owner`, `editor`, `commenter`, `viewer`) |
 | `doc_updates` | project, sequence number, Loro update bytes |
 | `doc_snapshots` | project, Loro snapshot bytes |
 | `checkpoints` | project, id, name, Loro frontiers, author, time, kind (`manual`, `auto`, `restore`, `import`) |
-| `project_assets` | project, asset hash, size |
+| `assets` | asset hash, size |
+| `project_assets` | project, asset hash: the assets uploaded to or imported into that project |
+| `settings` | key and value; holds the SHA-256 of the first-run setup code while one is open |
 
 The connection uses `journal_mode=WAL`, `synchronous=FULL` and
 `foreign_keys=ON`. `synchronous=FULL` makes each commit durable before
@@ -123,9 +125,25 @@ An update from a client goes through the project's room:
 6. The room sends the sender an `Ack` with its version vector.
 
 An asset upload writes the bytes to a temporary file, syncs it, renames it to
-its hash and syncs the directory. Only then does the server add the file entry
-to the Loro document. A crash can leave an unreferenced asset file, never a
-reference to a missing file.
+its hash and syncs the directory. Then, in one transaction, it records the
+asset and a `project_assets` row for the project it was uploaded to. Only then
+does the server add the file entry to the Loro document. A crash can leave an
+unreferenced asset file, never a reference to a missing file.
+
+An asset belongs to the projects that hold a `project_assets` row for it.
+Bytes are reachable only through such a project, by a member of it:
+`GET /api/projects/{id}/assets/{hash}` answers 404 unless the caller is a
+member and the project holds the asset, and the export resolves only assets
+the project holds. A hash in a document grants nothing. Someone who learns the
+hash of another project's image and writes it into their own document gets a
+compile error that the file is missing, not the bytes. Uploading the same
+bytes to another project adds a row for that project; the file on disk is
+shared.
+
+A project's stored document, its snapshot plus its log, may grow to 32 MiB.
+An update past that is refused with close code 4130, and an upload or import
+that would pass it gets HTTP 413. The limit holds after a restart, because the
+room counts what the store holds.
 
 ### Compaction
 
@@ -210,8 +228,12 @@ an unknown type, a short frame or bytes after the end of a frame closes the
 socket with 4000.
 
 The session cookie authenticates the socket. The server refuses the upgrade
-when the `Origin` header names another site, so a hostile page cannot open a
-socket with the user's cookie.
+with HTTP 403 unless the `Origin` header equals the public address (section
+6), so a hostile page cannot open a socket with the user's cookie. A handshake
+without an `Origin` header is refused too. A socket without a valid session
+is accepted and closed at once with 4401; a socket for a project that does
+not exist, or of which the user is not a member, is closed with 4004. The two
+cases look the same, so a socket does not reveal which project ids exist.
 
 ### The connection
 
@@ -276,13 +298,13 @@ In the unsafe state the page asks for confirmation before it closes.
 | 1000 | Normal close | Reconnect when the page needs the project again. |
 | 1006 | Connection lost | Reconnect with backoff. |
 | 4000 | Malformed frame | Reconnect with backoff; after three failures, show "Sync failed" with a reload button. |
-| 4001 | Unknown project | Show "This project does not exist" and stop. |
+| 4004 | Unknown project, or the user is not a member | Stop; the save state says "Stopped" with the reason. |
 | 4002 | Too slow | The client did not read its frames and its queue on the server filled. Reconnect with backoff. |
 | 4003 | Not allowed | Reload the role; continue read-only or leave the project. Local changes stay in IndexedDB. |
-| 4029 | Too many connections | Reconnect with longer backoff. |
-| 4130 | Update too large | Show "This change is too large to save"; keep it on the device. |
+| 4029 | Too many connections: the project has too many sockets, or the account has 32 open | Reconnect with backoff. |
+| 4130 | Update too large, or the project is at its 32 MiB limit | Show "This change is too large to save"; keep it on the device. |
 | 4400 | Protocol version mismatch | Show "Nisaba was updated. Reload to continue." Local changes stay in IndexedDB and go out after the reload. |
-| 4401 | Session expired | Show the sign-in form over the editor; reconnect after sign-in. |
+| 4401 | No valid session | Stop; the save state says "Stopped" with the reason. A reload shows the sign-in screen. Local changes stay in IndexedDB. |
 | 4409 | Project replaced | The project's epoch changed (section 10). Offer the unsent changes as a download, then clear the device log and reload. |
 | 4500 | Server error | Reconnect with backoff. |
 
@@ -383,29 +405,72 @@ normal edit, which they can undo, and nobody's later work is lost in history.
 
 ## 6. Accounts and sign-in
 
+### The public address
+
+`--public-url` names the address people type into the browser, such as
+`https://nisaba.example.org`: a scheme, a host and an optional port, nothing
+else. Without it, a server that listens on a loopback address uses
+`http://` and that address, and a server that listens on any other address
+refuses to start. A plain `http://` public address is accepted only when its
+host is loopback (`localhost`, a name under `.localhost`, `127.0.0.0/8` or
+`::1`). `--allow-insecure-http` accepts a plain-http address on the network
+anyway; passwords and session cookies then cross it unencrypted. TLS is left
+to a reverse proxy in front of the server.
+
+Three things follow from the public address: the session cookie (below), the
+origin check on every request that changes state, and the origin check on
+the sync socket. Both origin checks compare the `Origin` header with the
+public address, ignoring ASCII case.
+
 ### First run
 
-When the database has no users, the server prints a one-time setup code on
-standard output with its address. The setup page asks for the code, a name,
-an email address and a password. The first account is the server
-administrator. Without the code, a stranger on the same network could take
-the server before its owner does. When the server listens only on a loopback
-address, it skips the code.
+When the database has no users and the server can be reached from other
+machines, the server makes a setup code at start: 128 random bits written as
+eight groups of four hex digits. It prints the code once on standard output
+and stores only its SHA-256 in `settings`. Each start replaces the code. The
+server counts as reachable from other machines unless both the listen
+address and the public address are loopback; then it makes no code.
+
+The setup page asks for the code when one is open, and for a name, an email
+address and a password of at least 8 characters. The server compares the
+SHA-256 of the code, with everything but hex digits dropped and in lower
+case, against the stored hash in constant time. Checking that no user exists,
+checking the code, inserting the account and deleting the code are one
+`BEGIN IMMEDIATE` transaction, so two setups at once make exactly one owner;
+the other gets 409. A wrong code gets 403. Setup has no rate limit: a limit
+would let anyone lock the owner out, and 128 bits cannot be guessed.
+
+The first account is the server administrator. Without the code, a stranger
+on the same network could take the server before its owner does.
 
 ### Local accounts
 
-Passwords use Argon2id with the `argon2` crate's default parameters. The
-server stores a session as the SHA-256 of a random 32-byte token. The browser
-holds the token in a cookie named `nisaba_session` with `HttpOnly`,
-`SameSite=Lax`, `Path=/` and, behind HTTPS, `Secure`. Sessions last 30 days
-from the last use. Signing out deletes the session row.
+Passwords use Argon2id with the `argon2` crate's default parameters. At most
+four hashes run at once, on blocking threads; further sign-ins wait. A
+sign-in for an unknown email checks the password against a fixed hash, so
+both cases take the same time.
 
-Every request that changes state must have a JSON or binary content type and
-an `Origin` header that matches the server. Together with `SameSite=Lax`, this
-blocks cross-site request forgery without separate tokens.
+The server stores a session as the SHA-256 of a random 32-byte token. Behind
+an https public address the browser holds the token in a cookie named
+`__Host-nisaba_session` with `Secure`, `HttpOnly`, `SameSite=Lax` and
+`Path=/`; the `__Host-` prefix makes the browser refuse it unless it is
+secure, has that path and names no domain. Behind plain http the cookie is
+`nisaba_session` with the same attributes except `Secure`. Sessions last 30
+days from sign-in. Signing out deletes the session row; making a session
+deletes the expired ones.
 
-The server limits sign-in attempts to 10 per minute per address and per
-account.
+Every request other than `GET` and `HEAD` must carry an `Origin` header equal
+to the public address, or the server answers 403. Browsers send `Origin` on
+every such request, so a page of another site cannot make one with the
+user's cookie, and `SameSite=Lax` keeps the cookie off cross-site
+subrequests. There are no separate CSRF tokens. `GET` routes change nothing.
+
+The server allows 10 sign-in attempts per minute per account; the eleventh
+gets 429.
+
+Other limits: a request body may be 64 KiB, an asset upload 32 MiB and a
+project import 64 MiB (413 beyond). An account may hold 32 sync sockets at
+once; the next one is closed with 4029.
 
 ### Roles
 
@@ -508,10 +573,13 @@ a UTF-16 range, which is what the editor uses.
 The browser runs `LiveCompiler` in a dedicated worker.
 
 1. The page sends the worker each file once, then only files whose text or
-   hash changed. Asset bytes come from `/api/assets/{hash}` and are cached by
-   hash.
-2. While a compile runs, the page collects further changes. When the compile
-   ends, it sends one new compile request. At most one compile is in flight.
+   hash changed, and a removal for each path that left the document, so a
+   renamed or deleted file is gone from the preview as it is from the export.
+   Asset bytes come from `/api/projects/{id}/assets/{hash}` and are cached by
+   hash. A response other than 200 is a failure (below).
+2. While a compile runs, or assets load, the page collects further changes.
+   When the step ends, it sends one new compile request. At most one compile
+   is in flight.
 3. The worker compiles, compares page hashes with the previous compile, and
    reports the new page sizes and the list of changed pages.
 4. The worker rasterizes the changed pages that are on screen, at the pane's
@@ -535,23 +603,57 @@ text. A command in the editor and the palette jumps from the cursor to the
 matching place in the preview and scrolls it into view. The worker sends the
 text layer with the bitmap of the same page, so the two never disagree.
 
-When a compile takes longer than 10 s, the preview says "The preview is taking
-long" and offers "Restart preview", which ends the worker and starts a new
-one. The preview never switches silently to a server compile.
+### When the preview fails
+
+`Feed` (web/src/preview/feed.ts) decides what the page sends and when; its
+states are idle, fetching assets, compiling and failed, and its unit tests
+drive each path. Every path out of fetching and compiling clears the gate:
+
+- The worker answers `done` for the current compile: idle, and compile again
+  if anything changed meanwhile.
+- The worker says `failed` (the compiler or its fonts could not load, a font
+  file did not answer 200, or the compiler threw), the worker raises an
+  error, or a message cannot be read: failed.
+- A compile runs longer than 30 s: failed. The worker is busy and cannot be
+  asked to stop, so it is terminated.
+- An asset does not load: failed.
+
+On failure the page terminates the worker, starts a new one, forgets what it
+sent, and shows the message with "Retry now". It retries by itself after 1,
+2, 5, 10 and then every 20 s, at once on the next edit, and when the browser
+comes back online. A retry sends every file again. A compile that works
+resets the delays. A `done` from a worker that was replaced is ignored. The
+preview never switches to a server compile.
+
+### The date
+
+`datetime.today()` is the caller's local calendar date. The worker sets the
+date from the browser's clock before every compile, so a preview left open
+past midnight shows the new day. The export link carries the local date as
+`?today=YYYY-MM-DD`. The server uses it when it lies within one day of the
+server's UTC date, which covers every time zone, and otherwise uses the UTC
+date. A request without the parameter, or with a malformed one, gets the UTC
+date. Two exports of the same files on the same local day are therefore
+equal byte for byte.
 
 ### Rules for the preview
 
 - The preview path has no PDF. The worker draws pages from the compiled
   layout; only export makes a PDF.
 - At most one compile is in flight.
-- The preview never falls back to a server compile. A slow compile shows a
-  message and a restart button and stays in the browser.
+- The preview never falls back to a server compile. A failed or slow compile
+  shows a message and a retry button and stays in the browser.
+- The preview holds exactly the document's files. The test
+  `agreement.test.ts` renames and deletes files and checks that the preview's
+  compiler gives the same result as a fresh compile of every file, which is
+  what the export does; the server test `export_follows_a_rename_and_a_delete`
+  checks the export side with the same document.
 
 ### Export
 
-`GET /api/projects/{id}/export.pdf` reads the files from the project's room,
-writes them into a new `LiveCompiler` on a blocking thread, compiles and
-returns the PDF. The server keeps no compilers between exports. Typst's PDF
+`GET /api/projects/{id}/export.pdf?today=YYYY-MM-DD` reads the files from
+the project's room, resolves the assets the project holds, and compiles them
+in a child process. The server keeps no compilers between exports. Typst's PDF
 output depends only on its input, so the export equals, byte for byte, a
 compile of the same files anywhere else. The test
 `export_reads_the_same_state_as_sync` checks this: it edits through sync,
@@ -559,8 +661,54 @@ exports through HTTP, compiles the client's copy of the text locally and
 compares the bytes. The same property lets an offline client make the PDF
 itself.
 
-An export option selects PDF/A-2b output. A compile that runs longer than
-60 s is abandoned and the request fails with a clear message.
+A document is a program, and `#("x" * 1000000000000)` or a loop that never
+ends is a valid one. The export therefore runs in a child: the server starts
+its own binary with the hidden subcommand `__export`, an empty environment
+and the temporary directory as working directory, writes the files to its
+standard input and reads the PDF from its standard output. The child:
+
+1. sets `RLIMIT_AS` to the memory limit, `RLIMIT_CPU` to the time limit plus
+   one second, and `RLIMIT_CORE` to 0;
+2. reads the request and loads the embedded fonts;
+3. on Linux with Landlock (5.13 and later), takes away all file access, all
+   TCP binds and connects, and abstract Unix sockets and signals to other
+   processes (`AccessFs`, `AccessNet` and `Scope` at ABI 6, best effort, so
+   an older kernel enforces what it knows);
+4. compiles and writes the PDF, or writes the problems and exits with 2.
+
+The server kills the child when the deadline passes, and when the request is
+dropped. It answers:
+
+| Outcome | Status | Message |
+|---|---|---|
+| PDF | 200 | |
+| Compile problems | 422 | the problems |
+| Allocation failed or `SIGKILL`/`SIGABRT` | 422 | "the export ran out of memory: …" with the limit |
+| Deadline passed or `SIGXCPU` | 422 | "the export ran out of time: …" with the limit |
+| All slots and the queue full | 503 with `Retry-After: 30` | "the server is busy with other exports; try again in a minute" |
+| Anything else | 500 | what the child wrote |
+
+The limits are settings:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--export-memory-mb` | 1024 | address space of one export child, at least 64 |
+| `--export-seconds` | 60 | wall-clock deadline, at least 1 |
+| `--export-parallel` | 2 | exports that run at once |
+| `--export-queue` | 8 | exports that wait for a slot; beyond this, 503 |
+
+The server tests run exports with small limits: a terabyte string under
+512 MiB answers "out of memory", a nested loop under 2 s answers "out of
+time" while a second export with no queue answers 503, and a normal export
+works after each.
+
+Linux is the target. On other systems the child still runs as a separate
+process with the deadline, the kill, the parallel cap and the queue, so the
+server survives any document, but there is no memory limit and no file or
+network restriction: a document that allocates without end can exhaust the
+machine's memory before the deadline.
+
+An export option for PDF/A-2b output is planned.
 
 ### Fonts
 
@@ -704,8 +852,10 @@ Errors:
   underlines the same ranges.
 - Losing write access (4003) turns the editor read-only with a banner. Local
   changes stay on the device and the banner offers them as a download.
-- An expired session (4401) shows the sign-in form over the editor. The editor
-  keeps its state and its unsent changes.
+- An expired session (4401) stops sync and says so in the save state; a
+  reload shows the sign-in screen. Unsent changes stay in IndexedDB.
+- When the session request fails, the app shows the error and a Retry
+  button, and retries by itself every 5 s.
 - When IndexedDB is unavailable, as in some private windows, the save state
   says "Not saved on this device" while changes are unacknowledged, and the
   page asks for confirmation before it closes.

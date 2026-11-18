@@ -2,6 +2,8 @@
 //! exports and serves the web client.
 
 pub mod api;
+pub mod config;
+pub mod export;
 pub mod http;
 pub mod project;
 pub mod store;

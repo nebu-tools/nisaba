@@ -17,7 +17,7 @@ export type SaveState = "saved" | "saving" | "offline" | "unsafe" | "stopped"
 
 const HEARTBEAT_MS = 20_000
 /** Codes after which reconnecting cannot help. */
-const FINAL: number[] = [Close.forbidden, Close.version]
+const FINAL: number[] = [Close.forbidden, Close.notFound, Close.version, Close.signedOut]
 
 export class SyncClient {
   readonly doc = new LoroDoc()

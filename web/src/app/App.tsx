@@ -11,6 +11,9 @@ const projectParam = (): string | null => new URLSearchParams(location.search).g
 export function App(): JSX.Element {
   const [project, setProject] = createSignal(projectParam())
   const [session, { refetch }] = createResource(api.session)
+  // A failed session request shows its error and a retry, and retries by itself.
+  const retryTimer = setInterval(() => session.error && void refetch(), 5_000)
+  onCleanup(() => clearInterval(retryTimer))
   const onPop = (): void => void setProject(projectParam())
   window.addEventListener("popstate", onPop)
   onCleanup(() => window.removeEventListener("popstate", onPop))
@@ -19,11 +22,25 @@ export function App(): JSX.Element {
     setProject(id)
   }
   return (
-    <Show when={session()} fallback={<p class="empty">Loading…</p>}>
+    <Show
+      when={session.error ? undefined : session()}
+      fallback={
+        <Show when={session.error} fallback={<p class="empty">Loading…</p>}>
+          {(error) => (
+            <main class="narrow">
+              <p class="error" role="alert">
+                The server could not be reached: {(error() as Error).message}
+              </p>
+              <button onClick={() => void refetch()}>Retry</button>
+            </main>
+          )}
+        </Show>
+      }
+    >
       {(s) => (
         <Switch>
           <Match when={s().setup_needed}>
-            <Setup done={() => void refetch()} />
+            <Setup code={s().setup_code_needed} done={() => void refetch()} />
           </Match>
           <Match when={!s().user}>
             <Login done={() => void refetch()} />
@@ -62,17 +79,28 @@ function Form(props: { submit: (data: FormData) => Promise<void>; children: JSX.
 
 const field = (data: FormData, name: string): string => String(data.get(name) ?? "")
 
-function Setup(props: { done: () => void }): JSX.Element {
+function Setup(props: { code: boolean; done: () => void }): JSX.Element {
   return (
     <main class="narrow">
       <h1>Set up Nisaba</h1>
       <p>This server has no accounts yet. The account you create here owns the server.</p>
       <Form
         submit={async (d) => {
-          await api.setup({ name: field(d, "name"), email: field(d, "email"), password: field(d, "password") })
+          await api.setup({
+            name: field(d, "name"),
+            email: field(d, "email"),
+            password: field(d, "password"),
+            ...(props.code ? { setup_code: field(d, "setup_code") } : {}),
+          })
           props.done()
         }}
       >
+        <Show when={props.code}>
+          <label>
+            Setup code <input name="setup_code" required autocomplete="off" spellcheck={false} />
+          </label>
+          <p class="empty">The server printed the setup code to its log when it started.</p>
+        </Show>
         <label>
           Name <input name="name" autocomplete="name" />
         </label>
@@ -94,7 +122,7 @@ function Login(props: { done: () => void }): JSX.Element {
       <h1>Sign in</h1>
       <Form
         submit={async (d) => {
-          await api.login({ name: "", email: field(d, "email"), password: field(d, "password") })
+          await api.login({ email: field(d, "email"), password: field(d, "password") })
           props.done()
         }}
       >

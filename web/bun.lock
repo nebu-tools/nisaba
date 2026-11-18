@@ -9,7 +9,7 @@
         "@codemirror/view": "6.43.8",
         "codemirror": "6.0.2",
         "loro-codemirror": "0.3.3",
-        "loro-crdt": "1.13.9",
+        "loro-crdt": "1.18.0",
         "solid-js": "1.9.19",
       },
       "devDependencies": {
@@ -407,7 +407,7 @@
 
     "loro-codemirror": ["loro-codemirror@0.3.3", "", { "peerDependencies": { "@codemirror/state": "^6.0.0", "@codemirror/view": "^6.7.0", "loro-crdt": "^1.8.2" } }, "sha512-C6qAUmDjMTyoXVeDxKWixvr/TSTo/jXFrvgGW+wn6RAHeIzNFovBDLQNi/Sary4Ahx8DaYADTCm9eCaRAjvWtw=="],
 
-    "loro-crdt": ["loro-crdt@1.13.9", "", {}, "sha512-gZYkMy1mqP1wzZqhQ69rNQowOuohLPcLbVQ+MjeJh3dbiXR+XJnbbP1GMxkJ0uBNbRbGmR2w+LazSDQImIJDrw=="],
+    "loro-crdt": ["loro-crdt@1.18.0", "", {}, "sha512-e/96j7B6MUMVc+AilrY6c/Q4+0uNGhBIqhRosadqeEM1d9+IMpxYKy2mL22NIj6ILuZfP0fF5cYTkipxgbddHg=="],
 
     "lru-cache": ["lru-cache@5.1.1", "", { "dependencies": { "yallist": "^3.0.2" } }, "sha512-KpNARQA3Iwv+jTA0utUVVbrh+Jlrr1Fv0e56GGzAFOXN7dk/FviaDW8LHmK52DlcH4WP2n6gI8vN1aesBFgo9w=="],
 

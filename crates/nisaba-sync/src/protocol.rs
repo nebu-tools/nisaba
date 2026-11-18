@@ -22,9 +22,13 @@ pub mod close {
     pub const MALFORMED: u16 = 4000;
     pub const TOO_SLOW: u16 = 4002;
     pub const FORBIDDEN: u16 = 4003;
+    /// The project does not exist or the user is not a member.
+    pub const NOT_FOUND: u16 = 4004;
     pub const FULL: u16 = 4029;
     pub const TOO_LARGE: u16 = 4130;
     pub const VERSION: u16 = 4400;
+    /// The session cookie is missing or expired; sign in again.
+    pub const SIGNED_OUT: u16 = 4401;
     pub const SERVER_ERROR: u16 = 4500;
 }
 
