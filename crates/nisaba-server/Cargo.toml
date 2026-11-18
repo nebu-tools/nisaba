@@ -32,7 +32,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs", "thread"] }
+seccompiler = "0.5"
+libc = "0.2"
+
+[[test]]
+name = "sandbox"
+harness = false
 
 [dev-dependencies]
 tokio-tungstenite = "0.30"

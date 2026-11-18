@@ -1367,9 +1367,10 @@ async fn a_full_password_queue_answers_503() {
 #[tokio::test]
 async fn an_unsandboxed_export_is_refused_unless_allowed() {
     use nisaba_server::config::ExportLimits;
-    use nisaba_server::export::{Exporter, Sandbox};
+    use nisaba_server::export::Exporter;
+    use nisaba_server::sandbox::Sandbox;
     let exe = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nisaba"));
-    let none = || Sandbox::None("no Landlock in this test".into());
+    let none = || Sandbox::Off("no Landlock in this test".into());
     let dir = tempfile::tempdir().unwrap();
     let server = InProcess::start_with(
         dir.path(),

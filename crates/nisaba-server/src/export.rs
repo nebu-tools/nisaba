@@ -7,17 +7,18 @@
 //! standard output.
 //!
 //! On Linux the child limits its address space (`RLIMIT_AS`) and its CPU time
-//! (`RLIMIT_CPU`), asks to be killed when the server dies, reads every font
-//! into memory, and then gives up all file system access and TCP with
-//! Landlock. On every system the server kills the child at the deadline, runs
-//! at most `parallel` children at once, and lets at most `queue` more
-//! requests wait.
+//! (`RLIMIT_CPU`), asks to be killed when the server dies, reads its input
+//! and every font into memory, and then confines itself
+//! ([`crate::sandbox`]). On every system the server kills the child at the
+//! deadline, runs at most `parallel` children at once, and lets at most
+//! `queue` more requests wait.
 //!
-//! The sandbox fails closed. The server checks at start whether this system
-//! can enforce it ([`probe`]). If it cannot, every export is refused with
-//! [`ExportError::Unsandboxed`] unless the server was started with
-//! `--allow-unsandboxed-export`. The child checks again and stops when the
-//! sandbox it was told to require is not there.
+//! The sandbox fails closed. The server decides at start whether this kernel
+//! keeps every promise of the sandbox ([`sandbox::probe`]). If it does not,
+//! every export is refused with [`ExportError::Unsandboxed`] unless the
+//! server was started with `--allow-unsandboxed-export`. The child confines
+//! itself and stops when any part of the sandbox it was told to require
+//! cannot be enforced.
 //!
 //! A child never outlives its request. It is killed and reaped when the
 //! deadline passes, when the request is dropped because the client went
@@ -26,13 +27,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use nisaba_compile_core::FileContents;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::config::ExportLimits;
+use crate::sandbox::{self, Sandbox};
 use crate::web::Date;
 
 /// The hidden subcommand that runs one export.
@@ -99,53 +100,25 @@ impl std::fmt::Display for ExportError {
     }
 }
 
-/// How much of the sandbox this system enforces.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Sandbox {
-    /// Every rule.
-    Full,
-    /// The file system rules, but not every rule this build asks for, as on
-    /// a kernel without Landlock network rules.
-    Partial,
-    /// None, and why.
-    None(String),
-}
-
-impl Sandbox {
-    fn enforced(&self) -> bool {
-        !matches!(self, Self::None(_))
-    }
-}
-
-/// Whether this system can enforce the export sandbox. Tries it on a thread
-/// that ends at once; Landlock restricts only the thread that asks.
-#[must_use]
-pub fn probe() -> Sandbox {
-    std::thread::spawn(|| match sandbox() {
-        Ok(s) => s,
-        Err(e) => Sandbox::None(e),
-    })
-    .join()
-    .unwrap_or_else(|_| Sandbox::None("the check panicked".into()))
-}
-
 /// Runs exports in child processes within the limits.
 #[derive(Clone)]
 pub struct Exporter {
     exe: Arc<PathBuf>,
     limits: ExportLimits,
     sandbox: Sandbox,
+    /// A permit for each slot and each queue place. A request holds one
+    /// from the moment it is admitted until it ends, however it ends.
+    admitted: Arc<tokio::sync::Semaphore>,
     slots: Arc<tokio::sync::Semaphore>,
-    waiting: Arc<AtomicUsize>,
     stopping: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Exporter {
-    /// `exe` is the server binary, which the children run. Checks the
-    /// sandbox with [`probe`].
+    /// `exe` is the server binary, which the children run. Decides on the
+    /// sandbox with [`sandbox::probe`].
     #[must_use]
     pub fn new(exe: PathBuf, limits: ExportLimits) -> Self {
-        Self::with_sandbox(exe, limits, probe())
+        Self::with_sandbox(exe, limits, sandbox::probe())
     }
 
     /// As [`Exporter::new`], with the sandbox as given. For tests of a
@@ -154,8 +127,10 @@ impl Exporter {
     pub fn with_sandbox(exe: PathBuf, limits: ExportLimits, sandbox: Sandbox) -> Self {
         Self {
             exe: Arc::new(exe),
+            admitted: Arc::new(tokio::sync::Semaphore::new(
+                limits.parallel.saturating_add(limits.queue),
+            )),
             slots: Arc::new(tokio::sync::Semaphore::new(limits.parallel)),
-            waiting: Arc::default(),
             stopping: Arc::new(tokio::sync::watch::Sender::new(false)),
             sandbox,
             limits,
@@ -166,17 +141,17 @@ impl Exporter {
     #[must_use]
     pub fn describe(&self) -> String {
         match (&self.sandbox, self.limits.allow_unsandboxed) {
-            (Sandbox::Full, _) => "exports are sandboxed with Landlock".into(),
-            (Sandbox::Partial, _) => "exports are sandboxed with Landlock, without the rules \
-                 this kernel lacks; the file system rules hold"
+            (Sandbox::On, _) => "exports are sandboxed: Landlock and seccomp hold every \
+                 promise on this kernel"
                 .into(),
-            (Sandbox::None(why), false) => format!(
+            (Sandbox::Off(why), false) => format!(
                 "exports are turned off: this system cannot sandbox them ({why}); \
                  start with --allow-unsandboxed-export to allow them"
             ),
-            (Sandbox::None(why), true) => {
-                format!("exports are NOT sandboxed ({why}); allowed by --allow-unsandboxed-export")
-            }
+            (Sandbox::Off(why), true) => format!(
+                "exports are NOT sandboxed ({why}); allowed by --allow-unsandboxed-export; \
+                 the memory, CPU and time limits still hold"
+            ),
         }
     }
 
@@ -201,10 +176,9 @@ impl Exporter {
         files: Vec<(String, FileContents)>,
         today: Date,
     ) -> Result<Vec<u8>, ExportError> {
-        if !self.sandbox.enforced() && !self.limits.allow_unsandboxed {
-            let Sandbox::None(why) = &self.sandbox else {
-                unreachable!()
-            };
+        if let Sandbox::Off(why) = &self.sandbox
+            && !self.limits.allow_unsandboxed
+        {
             return Err(ExportError::Unsandboxed(why.clone()));
         }
         let mut stopping = self.stopping.subscribe();
@@ -222,24 +196,20 @@ impl Exporter {
         files: Vec<(String, FileContents)>,
         today: Date,
     ) -> Result<Vec<u8>, ExportError> {
-        let _slot = if let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() {
-            slot
-        } else {
-            let place = self.waiting.fetch_add(1, Ordering::SeqCst);
-            let waited = if place < self.limits.queue {
-                Arc::clone(&self.slots).acquire_owned().await.ok()
-            } else {
-                None
-            };
-            self.waiting.fetch_sub(1, Ordering::SeqCst);
-            waited.ok_or(ExportError::Busy)?
-        };
+        // Both permits go back when this future ends or is dropped.
+        let _admitted = Arc::clone(&self.admitted)
+            .try_acquire_owned()
+            .map_err(|_| ExportError::Busy)?;
+        let _slot = Arc::clone(&self.slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| ExportError::Stopping)?;
         self.run_child(&encode(today, &files)).await
     }
 
     async fn run_child(&self, input: &[u8]) -> Result<Vec<u8>, ExportError> {
         let failed = |e: std::io::Error| ExportError::Failed(e.to_string());
-        let sandbox = if self.sandbox.enforced() {
+        let sandbox = if self.sandbox == Sandbox::On {
             "required"
         } else {
             "optional"
@@ -358,8 +328,9 @@ impl Drop for Reaped {
 
 /// The child: `nisaba __export MEMORY_MB SECONDS required|optional PARENT`.
 /// Reads one request from stdin, writes the PDF to stdout and returns the
-/// exit status. With `required` it stops when the sandbox cannot be
-/// enforced.
+/// exit status. With `required` it confines itself first and stops when any
+/// part of the sandbox cannot be enforced. With `optional` it does not
+/// confine itself.
 #[must_use]
 pub fn child_main(args: &[String]) -> i32 {
     use std::io::{Read as _, Write as _};
@@ -396,13 +367,7 @@ pub fn child_main(args: &[String]) -> i32 {
             return EXIT_SETUP;
         }
     };
-    let missing = match sandbox() {
-        Ok(Sandbox::None(why)) | Err(why) => Some(why),
-        Ok(Sandbox::Full | Sandbox::Partial) => None,
-    };
-    if let Some(why) = missing
-        && required
-    {
+    if required && let Err(why) = sandbox::alone().and_then(|()| sandbox::confine()) {
         eprintln!("{why}");
         return EXIT_UNSANDBOXED;
     }
@@ -467,36 +432,6 @@ fn die_with(_parent: u32) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 fn limit(_memory_mb: u64, _seconds: u64) -> Result<(), String> {
     Ok(())
-}
-
-/// Takes away every file system right and TCP bind and connect from this
-/// thread and every thread it starts later, and stops it from signalling
-/// other processes or reaching abstract Unix sockets. Landlock applies what
-/// the running kernel supports and leaves the rest; the result says how much
-/// that was.
-#[cfg(target_os = "linux")]
-pub fn sandbox() -> Result<Sandbox, String> {
-    use landlock::{ABI, Access as _, AccessFs, AccessNet, Ruleset, RulesetAttr as _, Scope};
-    let abi = ABI::V6;
-    Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))
-        .and_then(|r| r.handle_access(AccessNet::from_all(abi)))
-        .and_then(|r| r.scope(Scope::from_all(abi)))
-        .and_then(Ruleset::create)
-        .and_then(landlock::RulesetCreated::restrict_self)
-        .map(|status| match status.ruleset {
-            landlock::RulesetStatus::FullyEnforced => Sandbox::Full,
-            landlock::RulesetStatus::PartiallyEnforced => Sandbox::Partial,
-            landlock::RulesetStatus::NotEnforced => {
-                Sandbox::None("this kernel has no Landlock, or it is turned off".into())
-            }
-        })
-        .map_err(|e| e.to_string())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn sandbox() -> Result<Sandbox, String> {
-    Ok(Sandbox::None("Landlock exists only on Linux".into()))
 }
 
 /// The request: magic, the date, then each file as a kind byte (0 text,
@@ -569,28 +504,29 @@ mod tests {
         assert!(decode(b"other").is_none());
     }
 
-    /// The restriction applies to the thread that asks for it, so a thread
-    /// of the test process can try it without affecting the other tests.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_sandbox_takes_away_files_and_network() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-        assert!(std::fs::File::open(manifest).is_ok());
-        std::thread::spawn(move || {
-            if !sandbox().unwrap().enforced() {
-                eprintln!("this kernel has no Landlock; nothing to test");
-                return;
-            }
-            assert!(std::fs::File::open(manifest).is_err(), "a file opened");
-            assert!(std::fs::read_dir("/").is_err(), "a directory was listed");
-            assert!(
-                std::net::TcpStream::connect(addr).is_err(),
-                "a TCP connection opened"
-            );
-        })
-        .join()
-        .unwrap();
+    /// One slot and one queue place. A waiter that is dropped while it
+    /// waits gives its place back, however often that happens.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_waiter_gives_its_place_back() {
+        use futures_util::FutureExt as _;
+        let limits = ExportLimits {
+            parallel: 1,
+            queue: 1,
+            ..ExportLimits::default()
+        };
+        // A child that never answers holds the slot.
+        let exporter = Exporter::with_sandbox("/bin/sleep".into(), limits, Sandbox::On);
+        let request = || exporter.pdf(Vec::new(), (2026, 11, 18));
+        let mut running = Box::pin(request());
+        assert!((&mut running).now_or_never().is_none(), "holds the slot");
+        for _ in 0..100 {
+            let mut waiter = Box::pin(request());
+            assert!((&mut waiter).now_or_never().is_none(), "queued");
+        }
+        let mut next = Box::pin(request());
+        assert_eq!((&mut next).now_or_never(), None, "queued, not refused");
+        let mut over = Box::pin(request());
+        assert_eq!((&mut over).now_or_never(), Some(Err(ExportError::Busy)));
     }
 }

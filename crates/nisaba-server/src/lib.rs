@@ -8,6 +8,7 @@ pub mod export;
 pub mod http;
 pub mod passwords;
 pub mod project;
+pub mod sandbox;
 pub mod store;
 pub mod sync;
 pub mod web;
