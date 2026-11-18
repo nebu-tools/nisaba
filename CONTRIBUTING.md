@@ -1,72 +1,39 @@
 # Contributing
 
-Discuss large changes in an issue before implementing them.
+Open an issue before you start a large change. [DESIGN.md](DESIGN.md) says what Nisaba should become and in what order.
 
-## Development setup
+## Tools
 
-Install Rust (the repository's `rust-toolchain.toml` selects the version),
-[Bun](https://bun.sh/) 1.3 or newer, and [just](https://github.com/casey/just).
-The local service stack also needs Docker with Compose v2.
+- Rust: `rust-toolchain.toml` picks the version and adds the `wasm32-unknown-unknown` target.
+- `wasm-bindgen-cli` at the version of `wasm-bindgen` in `Cargo.lock`.
+- [Bun](https://bun.sh) 1.3 and Node 22 or newer.
 
-1. Read the [architecture and package map](docs/architecture.md) and [domain vocabulary](CONTEXT.md).
-2. Run `bun install --frozen-lockfile` at the repository root.
-3. Follow the [local stack setup](docs/operations.md#1-quick-start) when you need running services. Never commit `.env`.
-4. Run the narrow test suite for the area you change, then the broader checks below.
+## Checks
 
-## Required checks
+CI runs these. Run them before you open a pull request:
 
-```bash
+```sh
+node scripts/build-wasm.mjs
+cd web
+bun install --frozen-lockfile
+bun run typecheck
+bun run lint
+bun run test
+bun run build
+cd ..
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked
-cargo test --workspace --all-targets --locked
-bun run --cwd web lint
-bun run --cwd web test
-bun run --cwd web build
-bun run --cwd tools lint
-bun run --cwd tools typecheck
-bun run --cwd tools test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-See [testing](docs/testing.md) for suite selection. `just ci-local` also runs
-dependency-policy and advisory checks. The external PDF test suite has
-additional system prerequisites documented in [`tools/README.md`](tools/README.md).
+The server embeds `web/dist-server`, so build the web client before you test the server.
 
+## Rules
 
-## Change guidelines
+- `crates/nisaba-server/src/api.rs` defines the HTTP API types. When you change them, run `NISABA_WRITE_API=1 cargo test -p nisaba-server api` and commit `web/src/app/api.gen.ts`.
+- Add a test for each change in behaviour.
+- Commit no build output, `.env` files or secrets.
 
-To build the browser compiler, install the `wasm32-unknown-unknown` Rust target
-and `wasm-bindgen-cli` matching the version in `Cargo.lock`, currently `0.2.127`.
-Run `just wasm-web`, then start or rebuild the web app. Generated files live in
-the ignored `web/src/wasm-generated/` directory. The script honors Cargo's configured
-target directory. Without generated files, previews use the server compiler.
+## Licence
 
-See the [UI design](docs/ui-design.md) for interface conventions and
-[dependency policy](docs/dependency-security.md) before changing dependencies.
-
-- Use Bun for every TypeScript workspace; do not add another lockfile.
-- Preserve `unsafe_code = "forbid"` and the workspace lint policy.
-- Keep `nisaba-core` free of I/O, CRDT, and web-framework dependencies.
-- Add tests for behavior changes, especially Unicode offsets, synchronization, authorization,
-  persistence, exports, and document projections.
-- Do not update golden fixtures merely to make a failing test pass; explain the intended output
-  change in the pull request.
-- Never commit credentials, `.env` files, build output, editor state, QA transcripts, or generated
-  reports outside their documented fixture/output directories.
-- Keep public documentation factual. Planned behavior must be labeled as planned.
-
-## Licensing
-
-The project is licensed under **AGPL-3.0-only** ([`LICENSE`](LICENSE)). By
-contributing, you agree that your contribution is licensed under AGPL-3.0-only
-as part of this repository. No per-file copyright or
-SPDX-License-Identifier headers are used; the repository relies on the
-top-level `LICENSE` file. Do not add headers to new files.
-
-## Commits and pull requests
-
-Use focused commits and describe:
-
-- the problem and chosen behavior,
-- migration or compatibility impact,
-- tests run,
-- security, durability, or compatibility implications where relevant.
+Nisaba is under the AGPL-3.0-only licence ([LICENSE](LICENSE)). You license your contribution under the same terms.

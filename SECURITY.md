@@ -1,35 +1,9 @@
-# Security Policy
+# Security
 
-## Project status
+Nisaba has no release yet. Do not use it for documents you cannot lose or must keep private.
 
-Nisaba is pre-production software. Do not use it for production documents or sensitive data.
+Report a vulnerability through GitHub's private vulnerability reporting for this repository (Security, then Advisories, then "Report a vulnerability"). Do not open a public issue for it.
 
-## Reporting a vulnerability
+Say which commit you tested, what an attacker can do, and how to reproduce it.
 
-Please do **not** open a public issue for a suspected vulnerability. Use GitHub's private
-vulnerability reporting for this repository (**Security → Advisories → Report a vulnerability**).
-If that feature is unavailable, contact a repository maintainer privately and request a secure
-reporting channel.
-
-Include, where possible:
-
-- affected commit or version,
-- impact and prerequisites,
-- reproduction steps or a minimal proof of concept,
-- any suggested mitigation,
-- whether credentials or personal data may have been exposed.
-
-Maintainers will acknowledge a report through the same private channel and coordinate disclosure
-and remediation there. No fixed response-time SLA is offered while the project is experimental.
-
-## Supported versions
-
-Only the current `main` branch receives security fixes before the first tagged release. A version
-support table will be added when stable releases exist.
-
-## Deployment warning
-
-The Compose stack and Keycloak realm are designed for local development. They include placeholder
-secrets, demo users, HTTP-only endpoints on private/local networks, and development defaults.
-Follow [`docs/security.md`](docs/security.md) and [`docs/operations.md`](docs/operations.md) and
-replace all such defaults before any non-local deployment.
+Only the `main` branch gets fixes.

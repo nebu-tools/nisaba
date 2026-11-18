@@ -1,27 +1,51 @@
+<img align="right" src="assets/branding/nisaba-logo.webp" alt="Nisaba logo: two mice write with quills on one long scroll under a stalk of grain" width="160" height="160">
+
 # Nisaba
 
-Nisaba is a self-hosted editor for writing Typst documents together. Edit text,
-suggest changes, discuss passages, and preview the result as a PDF. Projects
-hold your files, references, and revision history.
+Nisaba is a self-hosted editor in which several people write one Typst document at the same time. The browser compiles the document and shows the pages as you type.
 
-> [!WARNING]
-> Nisaba is experimental. It is not ready for production data.
+<br clear="right">
 
-## Start here
+## Current state
 
-- [Try it locally](docs/operations.md#1-quick-start): start the Docker stack and sign in.
-- [Write your first document](docs/user-guide.md): edit, review, share, and export.
-- [Work on the code](CONTRIBUTING.md): development setup and required checks.
+Nisaba is not ready for use. This much runs today:
 
-## Running Nisaba
+- One server program, `nisaba`, that keeps its data in one directory: an SQLite database and the asset files.
+- First-run setup of an owner account, sign-in with email and password, and sign-out.
+- A project list. You can create a project and open it.
+- Live editing of the project's files by several people at once, with sync over a WebSocket and a copy of unsent changes kept in the browser.
+- A preview that compiles in the browser and draws each page on a canvas.
+- PDF export from the server.
 
-Read the [deployment guide](docs/deployment.md) before exposing a server.
-[Operations](docs/operations.md) covers health checks and backups;
-[configuration](docs/configuration.md) lists the settings.
+This does not exist yet:
 
-For service boundaries and the repository map, see [architecture](docs/architecture.md).
+- Invitations, roles other than owner, and sign-in through OIDC.
+- Tracked changes, comments, references, checkpoints, history and restore.
+- Archived projects, the admin screen, font and package management.
+- Selectable text in the preview and the jumps between source and preview.
+- Most screens of the client. There is one plain screen with the file list, the editor and the preview.
 
-Report bugs in [GitHub issues](https://github.com/sims1253/nisaba/issues).
-Report security problems privately using [SECURITY.md](SECURITY.md).
+[DESIGN.md](DESIGN.md) describes the whole design and the order of the work.
 
-Licensed under [AGPL-3.0-only](LICENSE).
+## Build and run
+
+You need Rust (`rust-toolchain.toml` picks the version), `wasm-bindgen-cli` at the version of `wasm-bindgen` in `Cargo.lock`, Bun 1.3 and Node 22 or newer.
+
+```sh
+node scripts/build-wasm.mjs
+cd web
+bun install --frozen-lockfile
+bun run build
+cd ..
+cargo run --release -p nisaba-server -- --data ./data --listen 127.0.0.1:8080
+```
+
+Open http://127.0.0.1:8080 and create the owner account. The server embeds the web client, so build the client before the server.
+
+[CONTRIBUTING.md](CONTRIBUTING.md) lists the checks.
+
+## License
+
+Nisaba is free software under the GNU Affero General Public License, version 3 only. See [LICENSE](LICENSE).
+
+The logo is a stand-in sketch until a hand-painted one replaces it.
