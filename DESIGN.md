@@ -151,7 +151,7 @@ after a restart, because the room counts what the store holds.
 ### Compaction
 
 The room counts log entries and bytes since the last snapshot. After 500
-entries or 8 MB, it exports a full snapshot. In one transaction the store
+entries or 8 MiB, it exports a full snapshot. In one transaction the store
 writes the snapshot and deletes every log entry whose end version is inside
 the snapshot's version vector. An entry that arrived while the snapshot was
 being made stays in the log. Opening a room imports the snapshot and then the
@@ -233,9 +233,20 @@ shorter. The receiver joins the parts and reads the result as one frame. Both
 directions use the same code (`split` and `Assembler` in `nisaba-sync`, and
 `frames.ts` in the client), and the server uses it for Welcome too. The rules:
 
-- The receiver keeps at most the declared total. The server checks the total
-  against what the project has left under its 32 MiB limit when the Begin
-  arrives, and closes with 4130 before it keeps a single part.
+- The receiver keeps at most the declared total. When the Begin arrives,
+  the server reserves the declared total against what the project has left
+  under its 32 MiB limit, and closes with 4130 before it keeps a single part
+  if it does not fit. The reservation counts as stored until the update is
+  written or the transfer ends, so two clients cannot each start a transfer
+  that fits only alone.
+- All transfers on the server together hold at most `--sync-transfer-mb`
+  MiB (default 256, at least 32). A Begin beyond that is closed with 1013,
+  and the client sends again after its backoff.
+- Each transfer has a deadline from its Begin: 30 s plus 8 s for each
+  started MiB of the declared total, so 38 s for 1 MiB and 4 min 46 s for
+  32 MiB, about 115 KiB/s. When it passes, the server drops the parts, gives
+  back the reservation and the budget, and closes with 4008. The client
+  reconnects and sends the difference again.
 - Parts come in order, each exactly once. A missing, repeated or
   out-of-order part, more bytes than declared, another frame between the
   parts, or a part without a Begin closes the socket with 4000.
@@ -253,8 +264,11 @@ A socket belongs to the session that opened it. The server closes it at once
 when that access ends: with 4401 when the session is signed out, expires or
 its account is deleted, and with 4004 when the user stops being a member of
 the project. The store ends the socket's grant in the same step that takes
-the access away, and the socket loop checks the grant before it applies each
-frame, so no frame is applied after that moment. Expiry is checked during
+the access away. The room asks the grant again when it writes an update,
+inside the store's lock under which access ends, so an update that waited
+for the lock while access ended is not written, not sent on and not
+acknowledged. The socket loop also checks the grant before each frame and
+while it waits to send one. Expiry is checked during
 the socket's life, at least once a minute.
 
 The session cookie authenticates the socket. The server refuses the upgrade
@@ -333,7 +347,9 @@ In the unsafe state the page asks for confirmation before it closes.
 | 1006 | Connection lost | Reconnect with backoff. |
 | 4000 | Malformed frame, or parts out of order | Reconnect with backoff. After three in a row with no Ack between them, stop and show "Sync failed" with a Reload button. |
 | 4004 | Unknown project, or the user is not a member, or stopped being one | Stop; the save state says "Stopped" with the reason. |
-| 4002 | Too slow | The client did not read its frames and its queue on the server filled. Reconnect with backoff. |
+| 1013 | Try again later: the server holds too many large updates in parts at once | Reconnect with backoff and send again. |
+| 4002 | Too slow | The client did not read its frames: its queue on the server filled, or one frame waited 30 s to be sent. Reconnect with backoff. |
+| 4008 | An update in parts did not finish before its deadline | Reconnect with backoff and send again. |
 | 4003 | Not allowed | Planned: reload the role and continue read-only. Today the client stops as for 4004. Local changes stay in IndexedDB. |
 | 4029 | Too many connections: the project has too many sockets, or the account has 32 open | Reconnect with backoff. |
 | 4130 | The update, or its declared length, does not fit in what is left of the project's 32 MiB | Stop; do not retry. The save state says "Not saved: the project is full", and a note says that the edits are kept on this device and that copying the text into a new project lets the user go on. |
@@ -342,7 +358,11 @@ In the unsafe state the page asks for confirmation before it closes.
 | 4409 | Project replaced | Planned with the archive (section 10): offer the unsent changes as a download, then clear the device log and reload. |
 | 4500 | Server error | Reconnect with backoff. |
 
-Backoff starts at 0.5 s, doubles to 30 s and has random jitter. The client
+Backoff starts at 0.5 s, doubles to 30 s and has random jitter. It goes back
+to 0.5 s only on an Ack, or on a Welcome when the client has nothing to send,
+so a client whose update keeps failing waits longer each time. The server
+closes with a 2 s limit on the close frame, so a client that reads nothing
+cannot hold its socket open. The client
 sends a Heartbeat every 20 s and the server answers with one. The server
 closes a socket that sends nothing for 60 s.
 
@@ -730,29 +750,58 @@ its own binary with the hidden subcommand `__export`, an empty environment
 and the temporary directory as working directory, writes the files to its
 standard input and reads the PDF from its standard output. The child:
 
-1. sets `RLIMIT_AS` to the memory limit, `RLIMIT_CPU` to the time limit plus
-   one second, and `RLIMIT_CORE` to 0;
-2. reads the request and loads the embedded fonts;
 1. asks the kernel to kill it when the server ends (`PR_SET_PDEATHSIG`);
 2. sets `RLIMIT_AS` to the memory limit, `RLIMIT_CPU` to the time limit plus
    one second, and `RLIMIT_CORE` to 0;
 3. reads the request and loads the embedded fonts;
-4. on Linux with Landlock (5.13 and later), takes away all file access, all
-   TCP binds and connects, and abstract Unix sockets and signals to other
-   processes (`AccessFs`, `AccessNet` and `Scope` at ABI 6; an older kernel
-   enforces the rules it knows, which always include the file rules);
-5. compiles and writes the PDF, or writes the problems and exits with 2.
+4. checks that it holds no file descriptor but 0, 1 and 2 and runs no
+   thread but its own, and exits otherwise;
+5. confines itself (below);
+6. compiles and writes the PDF, or writes the problems and exits with 2.
 
-The sandbox fails closed. At start the server tries the Landlock rules on a
-thread of its own and prints one line that says whether exports are
-sandboxed. If the system cannot enforce them, every export is refused with
-503 and a message that says so, unless the server was started with
-`--allow-unsandboxed-export`. The child checks again and exits when a
-sandbox it was told to require is missing. An export without the sandbox is
-still limited: the compiler sees only the project's own files, which the
-server writes to the child's standard input, and the memory and time limits
-still apply. What it loses is the kernel's guarantee that a bug in the
-compiler cannot read other files or open connections.
+The sandbox makes four promises about a confined child:
+
+- Files: it reads only what the server wrote to its standard input and
+  writes only to its standard output. It can open, create, truncate, rename
+  or delete no file, and change no file's mode, owner, times or extended
+  attributes.
+- Sockets: it can create no socket of any family, TCP, UDP and Unix alike,
+  and no socket pair, and it holds no descriptor that is one.
+- Processes: it cannot signal, trace or read the memory of another process,
+  or change another process's limits or scheduling.
+- Privileges: it runs with `no_new_privs`, so nothing it runs gains rights.
+
+Landlock keeps the file promise. It needs ABI 3 (Linux 6.2), the first that
+can refuse truncation; the child handles every file right of ABI 3 and
+grants none. A seccomp filter keeps the other promises: `socket`,
+`socketpair`, `io_uring`, `ptrace`, `process_vm_readv`, the pidfd calls and
+signals to any process but the child's own fail with `EPERM`, and so do the
+path-based mode, owner, time and attribute calls Landlock does not cover. On
+`x86_64` the x32 calls fail too. Landlock does not take away network access
+here; seccomp does, by refusing the socket itself.
+
+The sandbox fails closed. At start the server checks, on a thread of its
+own, whether the kernel has Landlock ABI 3 and can install the seccomp
+filter, and prints one line that says whether exports are sandboxed. There
+is no middle state: if either is missing, every export is refused with 503
+and a message that says why, unless the server was started with
+`--allow-unsandboxed-export`. The child is told whether the sandbox is
+required, and when it is, it exits rather than compile if any step above
+fails. An export without the sandbox keeps the rest: the compiler sees only
+the project's own files, which the server writes to the child's standard
+input, and the memory, CPU and time limits, the kill when the server ends,
+the parallel cap and the queue still apply. It loses the four promises: a
+bug in the compiler could then read or change any file the server's user
+can, open network connections, or signal the server.
+
+The test `tests/sandbox.rs` runs on the kernel it finds. It fails, and does
+not skip, when that kernel cannot sandbox exports. For each promise it
+starts a child that confines itself the way an export does and tries the
+forbidden thing: UDP, TCP and Unix sockets, a socket pair, reading, creating
+and truncating a file, and signalling the parent. Each try must fail
+confined and succeed unconfined. It also starts a real export child with a
+leaked descriptor, which must refuse to run. CI runs it as a step of its
+own on Ubuntu 24.04, so a runner whose kernel cannot sandbox fails the build.
 
 A child never outlives its request. The server kills it and waits for it
 when the deadline passes, when the request is dropped because the client
@@ -785,16 +834,17 @@ The limits are settings:
 | `--allow-unsandboxed-export` | off | run exports even when the system cannot sandbox them |
 
 The server tests run exports with small limits: a terabyte string under
-512 MiB answers "out of memory", a nested loop under 2 s answers "out of
+512 MiB answers "out of memory", a nested loop under 5 s answers "out of
 time" while a second export with no queue answers 503, and a normal export
 works after each.
 
-Linux is the target. Other systems have no Landlock, so they refuse exports
-unless the server is started with `--allow-unsandboxed-export`. Then the
-child runs as a separate process with the deadline, the kill, the parallel
-cap and the queue, so the server survives any document, but there is no
-memory limit and no file or network restriction: a document that allocates
-without end can exhaust the machine's memory before the deadline.
+Linux is the target. Other systems have neither Landlock nor seccomp, so
+they refuse exports unless the server is started with
+`--allow-unsandboxed-export`. Then the child runs as a separate process with
+the deadline, the kill, the parallel cap and the queue, so the server
+survives any document, but none of the four promises holds and there is no
+memory limit: a document that allocates without end can exhaust the
+machine's memory before the deadline.
 
 An export option for PDF/A-2b output is planned.
 

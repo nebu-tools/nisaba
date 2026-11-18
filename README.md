@@ -16,16 +16,15 @@ Nisaba is not ready for use. This much runs today:
 - A project list. You can create a project and open it.
 - Live editing of the project's files by several people at once, with sync over a WebSocket and a copy of unsent changes kept in the browser. Large changes go in parts of 1 MiB.
 - A preview that compiles in the browser and draws each page on a canvas.
-- PDF export from the server, in a child process with memory, time and parallel limits. On Linux, Landlock also takes away its file and network access. A server that cannot apply that sandbox refuses exports unless it was started with `--allow-unsandboxed-export`.
+- PDF export from the server, in a child process with memory, time and parallel limits. On Linux 6.2 or newer the child is sandboxed with Landlock and seccomp. A server that cannot apply that sandbox refuses exports unless it was started with `--allow-unsandboxed-export`.
 
-A project's text and history may grow to 32 MiB. Assets do not count toward that limit.
+A project's text and history may grow to 32 MiB. Assets do not count toward that limit, and asset storage has no limit yet.
 
 This does not exist yet:
 
 - Invitations, roles other than owner, and sign-in through OIDC.
 - Tracked changes, comments, references, checkpoints, history and restore.
 - Backup and restore with `nisaba backup DEST`. Until then, stop the server and copy the data directory.
-- A limit on asset storage. Asset storage has no limit yet.
 - Deleting an asset, and renaming or deleting a project.
 - Archived projects, the admin screen, font and package management. Only the embedded fonts work; fonts in the data directory or in a project are not loaded.
 - A choice of entry file. The entry file is always `main.typ`.
@@ -64,9 +63,9 @@ cargo run --release -p nisaba-server -- --data ./data --listen 0.0.0.0:8080 --pu
 
 The server then prints a setup code to its log at start; the setup screen asks for it. It refuses a plain-http public address that is not loopback unless you pass `--allow-insecure-http`.
 
-Exports are limited by `--export-memory-mb` (default 1024), `--export-seconds` (60), `--export-parallel` (2) and `--export-queue` (8). DESIGN.md section 8 says what each does.
+Exports are limited by `--export-memory-mb` (default 1024), `--export-seconds` (60), `--export-parallel` (2) and `--export-queue` (8). DESIGN.md section 8 says what each does. `--sync-transfer-mb` (default 256, at least 32) caps the bytes of all updates that arrive in parts at once; DESIGN.md section 4 says how.
 
-The server prints one line at start that says whether exports are sandboxed. Exports are sandboxed only on Linux 5.13 or newer with Landlock turned on. Elsewhere the server refuses every export with a message that says why. `--allow-unsandboxed-export` lets them run anyway. An unsandboxed export still sees only the project's own files, and the memory and time limits still apply where the system has them. What it loses is the kernel's guarantee that a bug in the compiler cannot read other files on the server or open network connections.
+The server prints one line at start that says whether exports are sandboxed. Exports are sandboxed only on Linux 6.2 or newer with Landlock (ABI 3) turned on and seccomp available. A sandboxed export child can open no file, create no socket, signal or trace no other process, and gain no privileges; SECURITY.md lists the promises. Elsewhere the server refuses every export with a message that says why. `--allow-unsandboxed-export` lets them run anyway. An unsandboxed export still sees only the project's own files, and the memory, CPU and time limits still apply where the system has them. It loses the sandbox: a bug in the compiler could then read or change files the server's user can, open network connections, or signal the server.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) lists the checks.
 

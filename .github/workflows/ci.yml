@@ -69,6 +69,12 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # Fails, and does not skip, when this kernel cannot sandbox exports.
+      - name: Export sandbox
+        run: |
+          uname -r
+          cargo test --locked -p nisaba-server --test sandbox
+
       # Includes the check that web/src/app/api.gen.ts matches the Rust types.
       - name: cargo test
         run: cargo test --locked --workspace

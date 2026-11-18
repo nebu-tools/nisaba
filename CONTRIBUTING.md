@@ -28,6 +28,8 @@ cargo test --workspace
 
 The server embeds `web/dist-server`, so build the web client before you test the server.
 
+On Linux, `cargo test` includes `crates/nisaba-server/tests/sandbox.rs`, which fails on a kernel that cannot sandbox exports: one older than 6.2, or without Landlock or seccomp. It does not skip.
+
 ## Rules
 
 - `crates/nisaba-server/src/api.rs` defines the HTTP API types. When you change them, run `NISABA_WRITE_API=1 cargo test -p nisaba-server api` and commit `web/src/app/api.gen.ts`.
