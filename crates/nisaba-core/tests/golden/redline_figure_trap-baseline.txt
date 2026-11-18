@@ -1,5 +1,0 @@
-= Chapter Three
-
-#figure(image("logo.svg"))
-
-Text darunter.
