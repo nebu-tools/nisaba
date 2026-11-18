@@ -1,35 +1,24 @@
-# Security Policy
+# Security
 
-## Project status
+Nisaba has no release yet. Do not use it for documents you cannot lose or must keep private.
 
-Nisaba is pre-production software. Do not use it for production documents or sensitive data.
+Report a vulnerability through GitHub's private vulnerability reporting for this repository (Security, then Advisories, then "Report a vulnerability"). Do not open a public issue for it.
 
-## Reporting a vulnerability
+Say which commit you tested, what an attacker can do, and how to reproduce it.
 
-Please do **not** open a public issue for a suspected vulnerability. Use GitHub's private
-vulnerability reporting for this repository (**Security → Advisories → Report a vulnerability**).
-If that feature is unavailable, contact a repository maintainer privately and request a secure
-reporting channel.
+Only the `main` branch gets fixes.
 
-Include, where possible:
+## What the server does and does not protect
 
-- affected commit or version,
-- impact and prerequisites,
-- reproduction steps or a minimal proof of concept,
-- any suggested mitigation,
-- whether credentials or personal data may have been exposed.
+Sign-in. After three failed sign-ins for one email, the next attempt must wait 1 s, then 2 s, 4 s and so on up to 5 minutes. The server keeps these counts in memory for at most 10,000 emails. At most four password hashes run at once and 16 more wait; beyond that the server answers 503 at once. This slows guessing the password of one account. It does not stop a flood of sign-ins spread over many emails, which can keep the password workers busy and slow sign-in for everyone. Put a rate limit per client address in the reverse proxy in front of Nisaba, for example on `/api/login` and `/api/setup`.
 
-Maintainers will acknowledge a report through the same private channel and coordinate disclosure
-and remediation there. No fixed response-time SLA is offered while the project is experimental.
+Export. The server compiles each PDF in a child process. On Linux 6.2 or newer, with Landlock and seccomp available, the child confines itself before it compiles, and these promises hold:
 
-## Supported versions
+- Files: it reads only what the server wrote to its standard input and writes only to its standard output. It can open, create, truncate, rename or delete no file. Landlock (ABI 3) keeps this promise.
+- Sockets: it can create no socket of any kind, network or Unix, and holds no file descriptor but its standard input, output and error. A seccomp filter keeps this promise; Landlock is not what stops the network.
+- Processes: it cannot signal, trace or read the memory of another process, or change another process's limits or scheduling. The seccomp filter keeps this promise.
+- Privileges: it runs with `no_new_privs`.
 
-Only the current `main` branch receives security fixes before the first tagged release. A version
-support table will be added when stable releases exist.
+If the server cannot keep every promise, it refuses exports, unless it was started with `--allow-unsandboxed-export`. It prints one line at start that says which case holds. An unsandboxed export keeps the rest of its limits: the compiler sees only the project's own files, which the server hands it, and the memory, CPU and time limits still apply. It loses the promises: a bug in the compiler could then read or change files the server user can, open network connections, or signal the server. Do not pass the flag on a server whose users you do not trust.
 
-## Deployment warning
-
-The Compose stack and Keycloak realm are designed for local development. They include placeholder
-secrets, demo users, HTTP-only endpoints on private/local networks, and development defaults.
-Follow [`docs/security.md`](docs/security.md) and [`docs/operations.md`](docs/operations.md) and
-replace all such defaults before any non-local deployment.
+Sessions. Signing out, or the end of a session, closes its sync sockets at once. Removing a member closes their sockets to that project.

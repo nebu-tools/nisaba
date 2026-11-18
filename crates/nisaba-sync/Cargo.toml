@@ -1,0 +1,20 @@
+[package]
+name = "nisaba-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Project rooms and the sync wire protocol for Nisaba."
+
+[lints]
+workspace = true
+
+[dependencies]
+loro = "1.18"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

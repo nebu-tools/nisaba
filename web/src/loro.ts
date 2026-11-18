@@ -1,12 +1,6 @@
-/**
- * Browser initialization boundary for Loro.
- *
- * The package's implicit bundler entry can publish its JS classes before Vite
- * has completed WASM initialization. Awaiting the explicit web initializer
- * here gives the app and loro-codemirror one shared, ready module.
- */
+// loro-crdt's web build needs its WASM loaded before use. Every import of
+// "loro-crdt" resolves here (see vite.config.ts), so it is loaded once.
 import initializeLoro from "loro-crdt/web/loro_wasm.js"
 
 await initializeLoro()
-
 export * from "loro-crdt/web"

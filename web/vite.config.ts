@@ -1,51 +1,39 @@
-import { fileURLToPath } from "node:url"
-import { defineConfig, loadEnv } from "vite"
+import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
+import { brotliCompressSync, constants, gzipSync } from "node:zlib"
+import type { Plugin } from "vite"
+import solid from "vite-plugin-solid"
+import { defineConfig } from "vitest/config"
 
-export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), "")
-  // Compose publishes app on 8100 and sync on 8101 (docker-compose.yml).
-  const app = env.VITE_APP_URL || "http://localhost:8100"
-  const allowedHosts = (env.VITE_ALLOWED_HOSTS ?? "")
-    .split(",")
-    .map((host) => host.trim())
-    .filter((host) => host.length > 0)
-  // Optional dev-only OIDC proxy (see the "^/realms" rule below). Left unset by
-  // default: nothing in the repo serves a fallback target, and an unconditional
-  // rule with a dead default would 502 confusingly.
-  const oidcProxyTarget = env.VITE_OIDC_PROXY_TARGET
+const OUT = "dist-server"
+
+/** Writes a .br and a .gz copy next to each large output file. The server sends the best one the browser accepts. */
+function precompress(): Plugin {
+  const walk = (dir: string): string[] =>
+    readdirSync(dir).flatMap((name) => {
+      const path = join(dir, name)
+      return statSync(path).isDirectory() ? walk(path) : [path]
+    })
   return {
-    resolve: {
-      alias: [
-        // Keep every runtime import (including loro-codemirror's) behind the
-        // same explicitly initialized WASM boundary.
-        { find: /^loro-crdt$/, replacement: fileURLToPath(new URL("./src/loro.ts", import.meta.url)) }
-      ]
-    },
-    server: {
-      port: 5173,
-      // Vite always permits localhost and IP literals. Additional tunnel hosts
-      // must be opted into explicitly as a comma-separated allowlist.
-      allowedHosts,
-      proxy: {
-        // Mirrors deploy/web/nginx.conf: the app serves unprefixed CRUD routes
-        // (/projects, ...), so the /api prefix is stripped — except /api/compile,
-        // which the app serves under that exact path and which is forwarded
-        // verbatim. If these two rules drift from the nginx config, dev and
-        // production disagree about the wire contract.
-        "^/api/compile$": { target: app, changeOrigin: true },
-        "^/api/": { target: app, changeOrigin: true, rewrite: (path: string) => path.replace(/^\/api/, "") },
-        "/sync": { target: env.VITE_SYNC_URL || "ws://localhost:8101", ws: true, changeOrigin: true },
-        // Dev-only tunnel helper, opt-in via VITE_OIDC_PROXY_TARGET (no default):
-        // when the dev server is reached through a tunnel, the browser cannot
-        // address the developer's localhost Keycloak (docker-compose.yml runs it
-        // on 8090). Set VITE_OIDC_ISSUER to <tunnel-origin>/realms/... and
-        // VITE_OIDC_PROXY_TARGET to the IdP (e.g. http://127.0.0.1:8090) so the
-        // auth endpoints forward through Vite. Production has no equivalent
-        // (deploy/web/nginx.conf): browsers there reach the issuer directly.
-        ...(oidcProxyTarget ? { "^/realms": { target: oidcProxyTarget, changeOrigin: true } } : {})
+    name: "nisaba-precompress",
+    apply: "build",
+    closeBundle() {
+      for (const path of walk(OUT)) {
+        if (/\.(br|gz|png|webp|woff2)$/.test(path) || statSync(path).size < 1024) continue
+        const data = readFileSync(path)
+        writeFileSync(`${path}.br`, brotliCompressSync(data, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }))
+        writeFileSync(`${path}.gz`, gzipSync(data, { level: 9 }))
       }
     },
-    worker: { format: "es" },
-    build: { target: "es2022" }
   }
+}
+
+export default defineConfig({
+  plugins: [solid(), precompress()],
+  // Every "loro-crdt" import goes through src/loro.ts, which loads Loro's WASM first.
+  resolve: { alias: [{ find: /^loro-crdt$/, replacement: new URL("./src/loro.ts", import.meta.url).pathname }] },
+  worker: { format: "es" },
+  build: { outDir: OUT, emptyOutDir: true, target: "es2022" },
+  server: { proxy: { "/api": { target: "http://127.0.0.1:8080", ws: true } } },
+  test: { environment: "node", include: ["src/**/*.test.ts"] },
 })

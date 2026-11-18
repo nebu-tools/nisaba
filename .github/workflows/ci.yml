@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+
+      - name: Read the wasm-bindgen version
+        id: wb
+        run: echo "version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/version = "\(.*\)"/\1/p')" >> "$GITHUB_OUTPUT"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Build the WASM compiler and the fonts
+        run: node scripts/build-wasm.mjs
+
+      - name: Install web dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Web typecheck
+        working-directory: web
+        run: bun run typecheck
+
+      - name: Web lint
+        working-directory: web
+        run: bun run lint
+
+      - name: Web unit tests
+        working-directory: web
+        run: bun run test
+
+      - name: Web build
+        working-directory: web
+        run: bun run build
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # Fails, and does not skip, when this kernel cannot sandbox exports.
+      - name: Export sandbox
+        run: |
+          uname -r
+          cargo test --locked -p nisaba-server --test sandbox
+
+      # Includes the check that web/src/app/api.gen.ts matches the Rust types.
+      - name: cargo test
+        run: cargo test --locked --workspace
