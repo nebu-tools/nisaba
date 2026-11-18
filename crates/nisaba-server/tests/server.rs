@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use loro::{ExportMode, LoroDoc, LoroValue, ValueOrContainer, VersionVector};
-use nisaba_sync::{CatchUp, Frame};
+use nisaba_sync::{Frame, PROTOCOL_VERSION};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
 
 struct Server {
@@ -156,11 +156,8 @@ impl Peer {
         req.headers_mut().insert("cookie", cookie.parse().unwrap());
         let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         let hello = Frame::Hello {
-            proto: 3,
-            doc_id: project.to_owned(),
-            peer,
-            token: String::new(),
-            last_vv: Vec::new(),
+            protocol: PROTOCOL_VERSION,
+            version: Vec::new(),
         };
         ws.send(Message::Binary(hello.encode().into()))
             .await
@@ -172,22 +169,13 @@ impl Peer {
             doc,
             acked: VersionVector::default(),
         };
-        // Welcome with catch-up, then the first ack.
-        loop {
-            match me.recv().await {
-                In::Frame(Frame::Welcome {
-                    catchup: CatchUp::Updates(b) | CatchUp::Snapshot(b),
-                    ..
-                }) => {
-                    me.doc.import(&b).unwrap();
-                }
-                In::Ack(vv) => {
-                    me.acked = vv;
-                    break;
-                }
-                In::Frame(_) => {}
-            }
+        let In::Frame(Frame::Welcome { catch_up, version }) = me.recv().await else {
+            panic!("expected Welcome first");
+        };
+        if !catch_up.is_empty() {
+            me.doc.import(&catch_up).unwrap();
         }
+        me.acked = VersionVector::decode(&version).unwrap();
         me
     }
 
@@ -201,12 +189,13 @@ impl Peer {
             let Message::Binary(bytes) = msg else {
                 continue;
             };
-            if bytes[0] == 9 {
-                return In::Ack(VersionVector::decode(&bytes[5..]).unwrap());
-            }
             let frame = Frame::decode(&bytes, 1 << 26).unwrap();
-            if let Frame::Update(u) = &frame {
-                self.doc.import(u).unwrap();
+            match &frame {
+                Frame::Ack(vv) => return In::Ack(VersionVector::decode(vv).unwrap()),
+                Frame::Update(u) => {
+                    self.doc.import(u).unwrap();
+                }
+                _ => {}
             }
             return In::Frame(frame);
         }
@@ -318,13 +307,12 @@ async fn export_reads_the_same_state_as_sync() {
     assert!(bytes.starts_with(b"%PDF"));
     // Typst's PDF output is deterministic, so compiling the text the client
     // holds must give byte-for-byte the PDF the server exported.
-    let mut local = nisaba_compile_core::live::LiveCompiler::new("main.typ").unwrap();
-    local.write(
-        "main.typ",
-        nisaba_compile_core::live::FileContents::Text(a.main_text().to_string()),
-    );
-    assert!(local.compile().ok);
-    assert_eq!(local.pdf().unwrap(), bytes.to_vec());
+    let local = nisaba_server::web::pdf(vec![(
+        "main.typ".into(),
+        nisaba_compile_core::FileContents::Text(a.main_text().to_string()),
+    )])
+    .unwrap();
+    assert_eq!(local, bytes.to_vec());
 }
 
 #[tokio::test]

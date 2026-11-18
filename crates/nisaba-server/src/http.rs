@@ -13,12 +13,13 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
-use nisaba_compile_core::live::{FileContents, LiveCompiler};
+use nisaba_compile_core::FileContents;
 use nisaba_sync::Role;
 use serde::Deserialize;
 
+use crate::api::{AssetAdded, Created, Credentials, NewProject, Session, User};
 use crate::project::{self, NewFile};
-use crate::store::{Store, User};
+use crate::store::Store;
 use crate::sync::Rooms;
 
 const COOKIE: &str = "nisaba_session";
@@ -29,10 +30,6 @@ pub struct App {
     pub store: Store,
     pub rooms: Rooms,
 }
-
-#[derive(rust_embed::Embed)]
-#[folder = "../../web/dist-server"]
-struct WebClient;
 
 type ApiResult = Result<Response, (StatusCode, String)>;
 
@@ -56,7 +53,7 @@ pub fn router(app: App) -> Router {
         .route("/api/projects/{id}/export.pdf", get(export_pdf))
         .route("/api/assets/{hash}", get(asset))
         .route("/sync/{id}", get(sync_upgrade))
-        .fallback(get(static_file))
+        .fallback(get(crate::web::static_file))
         .with_state(app)
 }
 
@@ -107,18 +104,7 @@ fn new_session(app: &App, user: &User) -> ApiResult {
 async fn session(State(app): State<App>, headers: HeaderMap) -> ApiResult {
     let setup_needed = app.store.user_count().map_err(internal)? == 0;
     let user = current_user(&app, &headers).ok();
-    Ok(
-        axum::Json(serde_json::json!({ "setup_needed": setup_needed, "user": user }))
-            .into_response(),
-    )
-}
-
-#[derive(Deserialize)]
-struct Credentials {
-    email: String,
-    password: String,
-    #[serde(default)]
-    name: String,
+    Ok(axum::Json(Session { setup_needed, user }).into_response())
 }
 
 async fn setup(State(app): State<App>, axum::Json(body): axum::Json<Credentials>) -> ApiResult {
@@ -178,21 +164,6 @@ async fn list_projects(State(app): State<App>, headers: HeaderMap) -> ApiResult 
     Ok(axum::Json(app.store.projects_for(&user.id).map_err(internal)?).into_response())
 }
 
-#[derive(Deserialize)]
-struct NewProject {
-    name: String,
-    #[serde(default)]
-    files: Vec<ImportFile>,
-}
-
-/// A file in a project import: `text` for sources, `base64` for assets.
-#[derive(Deserialize)]
-struct ImportFile {
-    path: String,
-    text: Option<String>,
-    base64: Option<String>,
-}
-
 const STARTER: &str = "= Untitled\n\nStart writing here.\n";
 
 async fn create_project(
@@ -230,12 +201,9 @@ async fn create_project(
         });
     }
     let update = project::add_files(None, files).map_err(internal)?;
-    app.rooms.apply(&id, &update).await.map_err(internal)?;
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({ "id": id })),
-    )
-        .into_response())
+    let room = app.rooms.get(&id).await.map_err(internal)?;
+    room.apply(&update).await.map_err(internal)?;
+    Ok((StatusCode::CREATED, axum::Json(Created { id })).into_response())
 }
 
 /// Every file of the project, read from the live room.
@@ -246,7 +214,7 @@ async fn read_files(
 ) -> ApiResult {
     member(&app, &headers, &id)?;
     let room = app.rooms.get(&id).await.map_err(internal)?;
-    Ok(axum::Json(project::files(room.authority().inner())).into_response())
+    Ok(axum::Json(room.read(project::files)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -267,7 +235,7 @@ async fn upload_asset(
     }
     let hash = app.store.put_asset(&body).map_err(internal)?;
     let room = app.rooms.get(&id).await.map_err(internal)?;
-    let snapshot = room.authority().export_snapshot().map_err(internal)?;
+    let snapshot = room.snapshot().map_err(internal)?;
     let update = project::add_files(
         Some(&snapshot),
         vec![NewFile::Asset {
@@ -276,8 +244,8 @@ async fn upload_asset(
         }],
     )
     .map_err(internal)?;
-    app.rooms.apply(&id, &update).await.map_err(internal)?;
-    Ok(axum::Json(serde_json::json!({ "hash": hash })).into_response())
+    room.apply(&update).await.map_err(internal)?;
+    Ok(axum::Json(AssetAdded { hash }).into_response())
 }
 
 async fn asset(State(app): State<App>, headers: HeaderMap, Path(hash): Path<String>) -> ApiResult {
@@ -304,28 +272,22 @@ async fn export_pdf(
 ) -> ApiResult {
     member(&app, &headers, &id)?;
     let room = app.rooms.get(&id).await.map_err(internal)?;
-    let files = project::files(room.authority().inner());
+    let files = room.read(project::files);
     let store = app.store.clone();
     let started = std::time::Instant::now();
-    let pdf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let mut compiler = LiveCompiler::new("main.typ")?;
-        for file in files {
-            if let Some(text) = file.text {
-                compiler.write(&file.path, FileContents::Text(text));
-            } else if let Some(bytes) = file.hash.as_deref().and_then(|h| store.get_asset(h)) {
-                compiler.write(&file.path, FileContents::Bytes(bytes));
-            }
-        }
-        let result = compiler.compile();
-        if !result.ok {
-            let messages: Vec<_> = result
-                .problems
-                .iter()
-                .map(|p| p.message.clone())
-                .collect();
-            return Err(messages.join("; "));
-        }
-        compiler.pdf()
+    let pdf = tokio::task::spawn_blocking(move || {
+        let contents = files
+            .into_iter()
+            .filter_map(|file| {
+                let contents = match (file.text, file.hash) {
+                    (Some(text), _) => FileContents::Text(text),
+                    (None, Some(hash)) => FileContents::Bytes(store.get_asset(&hash)?),
+                    (None, None) => return None,
+                };
+                Some((file.path, contents))
+            })
+            .collect();
+        crate::web::pdf(contents)
     })
     .await
     .map_err(internal)?
@@ -352,40 +314,10 @@ async fn sync_upgrade(
     }
     let (_, role) = member(&app, &headers, &id)?;
     let role = match role.as_str() {
-        "owner" | "editor" => Role::Author,
-        "commenter" => Role::Reviewer,
-        _ => Role::ReadOnly,
+        "owner" | "editor" => Role::Editor,
+        "commenter" => Role::Commenter,
+        _ => Role::Viewer,
     };
     let rooms = app.rooms.clone();
     Ok(ws.on_upgrade(move |socket| crate::sync::run(socket, rooms, id, role)))
-}
-
-async fn static_file(uri: axum::http::Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    let (file, path) = match WebClient::get(path) {
-        Some(file) if !path.is_empty() => (file, path),
-        _ => match WebClient::get("index.html") {
-            Some(file) => (file, "index.html"),
-            None => return (StatusCode::NOT_FOUND, "web client not built").into_response(),
-        },
-    };
-    let mime = match path.rsplit('.').next() {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") => "text/javascript",
-        Some("css") => "text/css",
-        Some("wasm") => "application/wasm",
-        Some("svg") => "image/svg+xml",
-        Some("woff2") => "font/woff2",
-        _ => "application/octet-stream",
-    };
-    let cache = if path.starts_with("assets/") {
-        "public, max-age=31536000, immutable"
-    } else {
-        "no-cache"
-    };
-    (
-        [(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, cache)],
-        file.data.into_owned(),
-    )
-        .into_response()
 }

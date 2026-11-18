@@ -8,18 +8,9 @@
 
 use loro::{ExportMode, LoroDoc, LoroMap, LoroText, LoroValue, ValueOrContainer, VersionVector};
 
-pub const FILES: &str = "files";
+use crate::api::FileEntry;
 
-/// One file as the server reads it from the Loro document.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FileEntry {
-    pub id: String,
-    pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hash: Option<String>,
-}
+pub const FILES: &str = "files";
 
 /// A file to add to a project.
 pub enum NewFile {

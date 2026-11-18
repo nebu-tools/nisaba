@@ -13,9 +13,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use nisaba_sync::{DocId, OpLogStore, Snapshot, SnapshotStore, SyncError, SyncResult};
+use loro::VersionVector;
+use nisaba_sync::{RoomStore, Stored};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+
+use crate::api::{ProjectRow, User};
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS users (
@@ -49,7 +52,6 @@ CREATE TABLE IF NOT EXISTS doc_updates (
 );
 CREATE TABLE IF NOT EXISTS doc_snapshots (
   project_id TEXT PRIMARY KEY,
-  vv BLOB NOT NULL,
   bytes BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS assets (
@@ -63,26 +65,6 @@ CREATE TABLE IF NOT EXISTS assets (
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
     assets: PathBuf,
-}
-
-/// A row of the `users` table, without the password hash.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct User {
-    pub id: String,
-    pub email: String,
-    pub name: String,
-}
-
-/// A project as the project list shows it.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ProjectRow {
-    pub id: String,
-    pub name: String,
-    pub role: String,
-}
-
-fn storage(error: impl std::fmt::Display) -> SyncError {
-    SyncError::Storage(error.to_string())
 }
 
 #[must_use]
@@ -291,59 +273,62 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-#[async_trait::async_trait]
-impl OpLogStore for Store {
-    async fn append(&self, doc: &DocId, update: &[u8]) -> SyncResult<()> {
+impl RoomStore for Store {
+    fn load(&self, project: &str) -> Result<Stored, String> {
+        self.with(|c| {
+            let snapshot = c
+                .query_row(
+                    "SELECT bytes FROM doc_snapshots WHERE project_id = ?1",
+                    [project],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let mut stmt =
+                c.prepare("SELECT bytes FROM doc_updates WHERE project_id = ?1 ORDER BY seq")?;
+            let log = stmt
+                .query_map([project], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(Stored { snapshot, log })
+        })
+    }
+
+    fn append(&self, project: &str, update: &[u8]) -> Result<(), String> {
         self.with(|c| {
             c.execute(
                 "INSERT INTO doc_updates (project_id, seq, bytes) VALUES (?1,
                    (SELECT coalesce(max(seq), 0) + 1 FROM doc_updates WHERE project_id = ?1), ?2)",
-                params![doc.as_str(), update],
+                params![project, update],
             )
             .map(drop)
         })
-        .map_err(storage)
     }
 
-    async fn read_all(&self, doc: &DocId) -> SyncResult<Vec<Vec<u8>>> {
-        self.with(|c| {
-            let mut stmt =
-                c.prepare("SELECT bytes FROM doc_updates WHERE project_id = ?1 ORDER BY seq")?;
-            stmt.query_map([doc.as_str()], |r| r.get(0))?.collect()
-        })
-        .map_err(storage)
-    }
-
-    async fn len(&self, doc: &DocId) -> SyncResult<u64> {
-        self.log_len(doc.as_str())
-            .map(|n| u64::try_from(n).unwrap_or(0))
-            .map_err(storage)
-    }
-}
-
-#[async_trait::async_trait]
-impl SnapshotStore for Store {
     /// Replaces the snapshot and, in the same transaction, drops every log row
     /// the snapshot already contains.
-    async fn put(&self, doc: &DocId, snapshot: Snapshot) -> SyncResult<()> {
+    fn compact(
+        &self,
+        project: &str,
+        covers: &VersionVector,
+        snapshot: &[u8],
+    ) -> Result<(), String> {
         self.with(|c| {
             let tx = c.transaction()?;
             tx.execute(
-                "INSERT INTO doc_snapshots (project_id, vv, bytes) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (project_id) DO UPDATE SET vv = excluded.vv, bytes = excluded.bytes",
-                params![doc.as_str(), snapshot.vv.encode(), snapshot.bytes],
+                "INSERT INTO doc_snapshots (project_id, bytes) VALUES (?1, ?2)
+                 ON CONFLICT (project_id) DO UPDATE SET bytes = excluded.bytes",
+                params![project, snapshot],
             )?;
             let covered: Vec<i64> = {
                 let mut stmt =
                     tx.prepare("SELECT seq, bytes FROM doc_updates WHERE project_id = ?1")?;
-                let rows = stmt.query_map([doc.as_str()], |r| {
+                let rows = stmt.query_map([project], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
                 })?;
                 let mut covered = Vec::new();
                 for row in rows {
                     let (seq, bytes) = row?;
                     if let Ok(meta) = loro::LoroDoc::decode_import_blob_meta(&bytes, false)
-                        && snapshot.vv.includes_vv(&meta.partial_end_vv)
+                        && covers.includes_vv(&meta.partial_end_vv)
                     {
                         covered.push(seq);
                     }
@@ -353,45 +338,10 @@ impl SnapshotStore for Store {
             for seq in covered {
                 tx.execute(
                     "DELETE FROM doc_updates WHERE project_id = ?1 AND seq = ?2",
-                    params![doc.as_str(), seq],
+                    params![project, seq],
                 )?;
             }
             tx.commit()
         })
-        .map_err(storage)
-    }
-
-    async fn latest(&self, doc: &DocId) -> SyncResult<Option<Snapshot>> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT vv, bytes FROM doc_snapshots WHERE project_id = ?1",
-                [doc.as_str()],
-                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()
-        })
-        .map_err(storage)?
-        .map(|(vv, bytes)| {
-            Ok(Snapshot {
-                vv: loro::VersionVector::decode(&vv).map_err(storage)?,
-                bytes,
-            })
-        })
-        .transpose()
-    }
-
-    async fn list(&self, doc: &DocId) -> SyncResult<Vec<Snapshot>> {
-        Ok(self.latest(doc).await?.into_iter().collect())
-    }
-
-    async fn drop_all(&self, doc: &DocId) -> SyncResult<()> {
-        self.with(|c| {
-            c.execute(
-                "DELETE FROM doc_snapshots WHERE project_id = ?1",
-                [doc.as_str()],
-            )
-            .map(drop)
-        })
-        .map_err(storage)
     }
 }

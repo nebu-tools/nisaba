@@ -572,8 +572,8 @@ lifetime; `fonts.json` is revalidated on each visit. The compiler starts with
 the catalogue only. When a compile needs a face whose data it lacks, it
 reports the face in `missing_fonts`. The worker fetches those files, adds
 them and compiles again, so a document downloads only the faces it uses. The
-server export loads fonts the same way from its embedded copy. The fonts are
-the Typst defaults: Libertinus Serif, New Computer Modern and DejaVu Sans
+server export adds every font from its embedded copy before it compiles.
+The fonts are the Typst defaults: Libertinus Serif, New Computer Modern and DejaVu Sans
 Mono. The administrator can add fonts to `DATA/fonts`. A project can carry
 its own font files, and the compiler adds any `.ttf`, `.otf` or `.woff2` file
 in the project.
