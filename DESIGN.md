@@ -3,7 +3,7 @@
 Nisaba is a collaborative editor for Typst documents. Several people edit one
 project at the same time, review each other's changes, discuss them in
 comments, cite references, and see a live preview of the typeset pages. This
-document describes how the rebuilt Nisaba works and why.
+document describes how Nisaba works and why.
 
 The design follows five rules.
 
@@ -32,9 +32,9 @@ The design follows five rules.
 8. Compile pipeline, fonts and packages
 9. Web client
 10. Export and the project archive
-11. Migration from the previous version
-12. Performance targets
-13. Out of scope
+11. Performance targets
+12. Out of scope
+13. Build order
 
 ## 1. Repository layout
 
@@ -42,33 +42,21 @@ The design follows five rules.
 crates/
   nisaba-server/      the `nisaba` binary: HTTP, accounts, sync, storage,
                       export, history, archive import and export
-  nisaba-sync/        rooms, wire protocol, authority document, review policy
+  nisaba-sync/        rooms and the wire protocol
   nisaba-compile-core/ LiveCompiler: incremental Typst compile, page
                       fingerprints, raster and PDF output
   nisaba-compile-wasm/ wasm-bindgen wrapper of LiveCompiler for the browser
-  nisaba-references/  reference model, import, deduplication, output;
-                      no dependency on any other Nisaba crate
 web/
   src/app/            screens and the workspace shell
   src/sync/           sync client and the device log in IndexedDB
   src/editor/         CodeMirror setup, review marks, comments, presence
   src/preview/        preview worker and page view
+  bench/              the test document generator and the benchmark script
   e2e/                Playwright tests against the real binary
 ```
 
 The server crate is a library with a thin `main.rs`, so integration tests
 start the real binary on a free port with a temporary data directory.
-
-The following parts of the previous version are deleted, not ported:
-`services/app`, `services/compile`, the Postgres migrations, `deploy/` with its
-Keycloak, nginx and Postgres containers, `docker-compose.yml`, `tools/`,
-`crates/nisaba-core-wasm`, `crates/nisaba-export`, `crates/nisaba-auth`, the
-S3 and file-system stores in the sync crate, the token and identity-provider
-role code, the DOCX tooling, the search provenance records, and the
-bibliography renumbering and full-text export code in `nisaba-references`.
-`services/sync` moves to `crates/nisaba-sync` and keeps its room, protocol and
-review-policy code. `crates/nisaba-core` keeps only what the server needs to
-read review marks for export; the rest moves into the client or is deleted.
 
 ## 2. Data on disk
 
@@ -114,7 +102,7 @@ and plain files are easy to copy, deduplicate and check.
 | `projects` | id, name, entrypoint path, epoch, created and updated time |
 | `members` | project, user, role (`owner`, `editor`, `commenter`, `viewer`) |
 | `doc_updates` | project, sequence number, Loro update bytes |
-| `doc_snapshots` | project, version vector, Loro snapshot bytes |
+| `doc_snapshots` | project, Loro snapshot bytes |
 | `checkpoints` | project, id, name, Loro frontiers, author, time, kind (`manual`, `auto`, `restore`, `import`) |
 | `project_assets` | project, asset hash, size |
 
@@ -132,7 +120,7 @@ An update from a client goes through the project's room:
 3. The room inserts the bytes into `doc_updates` and commits.
 4. The room imports the update into its in-memory document.
 5. The room sends the update to the other clients in the project.
-6. The session sends the sender an `Ack` with the room's version vector.
+6. The room sends the sender an `Ack` with its version vector.
 
 An asset upload writes the bytes to a temporary file, syncs it, renames it to
 its hash and syncs the directory. Only then does the server add the file entry
@@ -202,20 +190,24 @@ in-memory document directly.
 
 ## 4. Sync protocol
 
-Protocol version 3 keeps the binary frames of version 2 and adds one frame.
-All lengths are big-endian `u32`.
+Nisaba speaks its own protocol, version 1. Each WebSocket binary message is
+one frame: a `u8` type followed by its fields. A blob is a big-endian `u32`
+length followed by that many bytes.
 
-| Tag | Frame | Direction | Fields |
+| Type | Frame | Direction | Fields |
 |---|---|---|---|
-| 1 | Hello | client to server | protocol version (`u8`), project id, peer id (`u64`), unused token, client version vector |
-| 2 | Welcome | server to client | status, note, catch-up (none, updates or snapshot) |
-| 3 | Update | both | Loro update bytes |
-| 4 | Snapshot | server to client | Loro snapshot bytes |
-| 5 | Presence | both | Loro ephemeral-store bytes |
+| 1 | Hello | client to server | protocol version (`u8`), client version vector (blob) |
+| 2 | Welcome | server to client | catch-up (blob), server version vector (blob) |
+| 3 | Update | both | Loro update (blob) |
+| 4 | Ack | server to client | server version vector (blob) |
+| 5 | Presence | both | Loro ephemeral-store bytes (blob) |
 | 6 | Heartbeat | both | none |
-| 7 | Error | server to client | code (`u16`), message |
-| 8 | Bye | client to server | none |
-| 9 | Ack | server to client | server version vector |
+
+The socket URL `/sync/{project}` names the project, so Hello carries no
+project id. The WebSocket close frame carries every error as a code and a
+reason (below), so there is no error frame and no goodbye frame. A frame with
+an unknown type, a short frame or bytes after the end of a frame closes the
+socket with 4000.
 
 The session cookie authenticates the socket. The server refuses the upgrade
 when the `Origin` header names another site, so a hostile page cannot open a
@@ -224,25 +216,31 @@ socket with the user's cookie.
 ### The connection
 
 1. The client opens the socket and sends Hello with the version vector of its
-   local document.
-2. The server sends Welcome with every update the client lacks, or a
-   snapshot when an update set cannot fill the gap.
-3. The server sends Ack with its version vector.
-4. The client exports every change the server's version vector does not
+   local document, or an empty blob when it holds nothing.
+2. The server sends Welcome. The catch-up holds every operation the client
+   lacks, as Loro update or snapshot bytes; the client imports either kind
+   the same way. It is empty when the client lacks nothing. The version
+   vector is what the server holds.
+3. The client exports every change the server's version vector does not
    include and sends it as one Update.
-5. From then on, the client sends each local change as an Update when the
+4. From then on, the client sends each local change as an Update when the
    change happens. It does not wait for the previous Ack.
-6. The server sends an Ack after each update it has committed.
+5. The server sends an Ack after each update it has committed. An update the
+   server already holds gets an Ack without a second write.
 
 The client does not keep a queue of unsent updates. It computes what to send
-from the last Ack. A lost frame, a dropped socket or a server restart
-therefore needs no special case: the next connection sends the difference
-again, and Loro ignores operations it already holds.
+from the last version vector it received in a Welcome or an Ack. A lost frame,
+a dropped socket or a server restart therefore needs no special case: the next
+connection sends the difference again, and Loro ignores operations it already
+holds.
 
 ### The no-lost-ack rule
 
 The server sends an Ack only after the update is committed to SQLite with
 `synchronous=FULL`. The Ack carries a version vector, not a sequence number.
+The room writes an update to the log before it imports it, so its document
+never holds an operation that is not durable, and every version vector in a
+Welcome or an Ack is safe to count as saved.
 The client says "Saved" only when the acknowledged version vector includes
 the version vector of its local document. These two rules mean that "Saved"
 is never shown for an edit that a crash can remove. The integration test
@@ -279,6 +277,7 @@ In the unsafe state the page asks for confirmation before it closes.
 | 1006 | Connection lost | Reconnect with backoff. |
 | 4000 | Malformed frame | Reconnect with backoff; after three failures, show "Sync failed" with a reload button. |
 | 4001 | Unknown project | Show "This project does not exist" and stop. |
+| 4002 | Too slow | The client did not read its frames and its queue on the server filled. Reconnect with backoff. |
 | 4003 | Not allowed | Reload the role; continue read-only or leave the project. Local changes stay in IndexedDB. |
 | 4029 | Too many connections | Reconnect with longer backoff. |
 | 4130 | Update too large | Show "This change is too large to save"; keep it on the device. |
@@ -288,8 +287,8 @@ In the unsafe state the page asks for confirmation before it closes.
 | 4500 | Server error | Reconnect with backoff. |
 
 Backoff starts at 0.5 s, doubles to 30 s and has random jitter. The client
-sends a Heartbeat every 20 s. The server closes a socket that sends nothing
-for 60 s.
+sends a Heartbeat every 20 s and the server answers with one. The server
+closes a socket that sends nothing for 60 s.
 
 The epoch is a random value per project. It changes only when an archive
 import replaces the project's document. A restore from backup does not change
@@ -298,7 +297,9 @@ it, because there the clients' extra edits are wanted.
 ### Presence
 
 Cursors and selections travel as Loro ephemeral-store bytes in Presence
-frames. The server relays them and does not store them.
+frames. The server sends each one to the other clients in the project. It
+does not store them and keeps no list of who is present; each client builds
+that list from the frames it receives.
 
 ## 5. Tracked changes, comments and history
 
@@ -306,9 +307,7 @@ frames. The server relays them and does not store them.
 
 Tracked changes are Loro rich-text marks on the file's text. Marks belong to
 the characters they cover, so they move correctly when other people edit
-around them at the same time. The previous version stored suggestions as
-offsets in a separate map and had to repair them after concurrent edits; this
-design has no repair step.
+around them at the same time.
 
 There are two mark keys:
 
@@ -332,7 +331,8 @@ Commenters may only suggest. The room checks each update from a commenter:
 the update may add text only inside a new `ins` mark by that commenter, and
 may remove text only inside that commenter's own `ins` marks. It may add `del`
 marks and change thread containers. The room refuses any other update with
-close code 4003.
+close code 4003. Until this check exists (build step N4), the room refuses
+every update from a commenter.
 
 The export reads marks too. "As written" leaves the text as it is, with
 suggested insertions and suggested deletions both present. "With suggestions
@@ -442,79 +442,10 @@ or groups from the identity provider. Project roles live only in `members`.
 
 ## 7. References
 
-### The crate
-
-`nisaba-references` is a standalone Rust crate. It depends on `serde`,
-`serde_json`, `biblatex`, `quick-xml` and `hayagriva`, and on nothing from
-Nisaba. Other programs can use it, and later it gets WebAssembly and Python
-bindings. Its interface:
-
-```rust
-/// One reference, in the CSL-JSON data model.
-pub struct Item {
-    pub id: String,                  // the citation key
-    pub kind: ItemType,              // CSL type: article-journal, book, chapter, ...
-    pub title: Option<String>,
-    pub author: Vec<Name>,
-    pub editor: Vec<Name>,
-    pub issued: Option<Date>,
-    pub container_title: Option<String>,
-    pub publisher: Option<String>,
-    pub volume: Option<String>,
-    pub issue: Option<String>,
-    pub page: Option<String>,
-    pub doi: Option<String>,
-    pub pmid: Option<String>,
-    pub isbn: Option<String>,
-    pub url: Option<String>,
-    pub other: BTreeMap<String, serde_json::Value>, // fields without a typed slot
-}
-
-pub struct Name { pub family: Option<String>, pub given: Option<String>, pub literal: Option<String> }
-pub struct Date { pub year: i32, pub month: Option<u8>, pub day: Option<u8> }
-
-pub enum Format { BibTeX, Ris, PubMed, CslJson }
-
-pub struct Imported { pub items: Vec<Item>, pub warnings: Vec<Warning> }
-pub struct Warning { pub line: Option<usize>, pub message: String }
-
-pub fn detect(input: &str) -> Option<Format>;
-pub fn import(input: &str, format: Format) -> Result<Imported, ImportError>;
-
-pub fn normalize(item: &mut Item);                  // DOI, PMID, ISBN, whitespace
-pub fn assign_keys(items: &mut [Item], taken: &BTreeSet<String>);
-pub fn duplicates(items: &[Item]) -> Vec<Vec<usize>>;
-
-pub fn to_csl_json(items: &[Item]) -> String;
-pub fn to_bibtex(items: &[Item]) -> String;
-pub fn to_ris(items: &[Item]) -> String;
-pub fn to_hayagriva(items: &[Item]) -> hayagriva::Library;
-pub fn to_hayagriva_yaml(items: &[Item]) -> String;
-```
-
-Import keeps real citation keys and real entry types. BibTeX keys and CSL-JSON
-ids are kept as they are. RIS and PubMed records have no key, so
-`assign_keys` makes one from the first author's family name, the year and the
-first significant title word, such as `okafor2019tide`, and adds `a`, `b` and
-so on when a key is taken. It never changes a key the source gave. Entry types
-map to CSL types with a fixed table; for example BibTeX `@article` becomes
-`article-journal` and RIS `CHAP` becomes `chapter`. An unknown type becomes
-`document` with a warning. Fields without a typed slot go into `other`, so
-CSL-JSON goes through import and export without loss.
-
-PubMed import reads the MEDLINE text format (`.nbib`) and the E-utilities XML
-format.
-
-`duplicates` groups items that are the same work. Two items match when they
-have the same normalized DOI, or else the same PMID, or else the same folded
-title, year and first author's family name. The crate does not merge; the
-caller decides.
-
-The WebAssembly binding later exposes `import`, `duplicates`, `assign_keys`
-and the four output functions with CSL-JSON strings as input and output. The
-Python binding (PyO3 and maturin) exposes the same functions with lists of
-dictionaries. Because the binding surface is CSL-JSON in and CSL-JSON out, the
-bindings stay thin and need no second data model.
+Nisaba uses [pinakes](https://github.com/nebu-tools/pinakes), a separate Rust
+library, for reference import, citation keys, duplicate detection and
+Hayagriva output. pinakes works on CSL-JSON items, the same form the project
+document stores, so Nisaba keeps no reference model of its own.
 
 ### In Nisaba
 
@@ -525,13 +456,13 @@ like everything else.
 
 There is one citation system: Typst's own. Authors cite with `@key` and print
 the list with `#bibliography`. The compiler sees the project's library as a
-generated file `references.yml` in hayagriva format, built with
-`to_hayagriva_yaml`. Authors write `#bibliography("references.yml")`. A
+generated file `references.yml` in Hayagriva format, built by pinakes.
+Authors write `#bibliography("references.yml")`. A
 project can also carry its own `.bib` file; Typst reads it directly. Nisaba
 adds no citation syntax and no numbering step of its own.
 
-The references panel imports a file or pasted text in any of the four formats,
-shows duplicates before it adds anything, and lets the user edit an entry.
+The references panel imports a file or pasted text in any format pinakes
+reads, shows duplicates before it adds anything, and lets the user edit an entry.
 The editor completes `@` with keys from the library and from `.bib` files in
 the project.
 
@@ -547,14 +478,24 @@ recompiles only what it affects.
 
 ```rust
 impl LiveCompiler {
-    pub fn new(entry: &str) -> Result<Self, String>;
+    pub fn new(entry: &str, fonts: &[FontEntry]) -> Result<Self, String>; // catalogue only, no font data
+    pub fn add_font(&mut self, index: usize, data: Vec<u8>);
+    pub fn set_today(&mut self, year: i32, month: u8, day: u8);
     pub fn write(&mut self, path: &str, contents: FileContents); // Text or Bytes
     pub fn remove(&mut self, path: &str);
-    pub fn compile(&mut self) -> Compiled;  // page fingerprints, sizes, problems
+    pub fn compile(&mut self) -> Compiled; // page hashes, sizes, problems, missing fonts
     pub fn page_rgba(&self, index: usize, pixel_per_pt: f32) -> Option<(u32, u32, Vec<u8>)>;
-    pub fn page_svg(&self, index: usize) -> Option<String>;
     pub fn pdf(&self) -> Result<Vec<u8>, String>;
 }
+```
+
+Build step N10 adds three methods for the text layer and the jumps between
+source and preview:
+
+```rust
+    pub fn page_text(&self, index: usize) -> Vec<TextRun>;  // text, position, size
+    pub fn source_at(&self, index: usize, x: f32, y: f32) -> Option<(String, usize)>;
+    pub fn preview_at(&self, path: &str, offset: usize) -> Vec<(usize, f32, f32)>;
 ```
 
 `compile` returns a 128-bit hash for each page. Equal hashes mean equal pages.
@@ -582,33 +523,29 @@ The browser runs `LiveCompiler` in a dedicated worker.
 Rasterizing in the worker matters. An SVG page of the test document is about
 400 KB of markup. Inserting one into the page cost the main thread about
 210 ms, and keystroke-to-page latency was 640 ms. With bitmaps the main thread
-spends under 1 ms per page, and the median latency is 82 to 88 ms (section 12).
+spends under 1 ms per page, and the median latency is 82 to 88 ms (section 11).
 
-A clickable text layer for jumping from the preview to the source is built
-from the page frame's text positions and sent with the bitmap. It is not
-part of the first version.
+### The text layer
+
+Each page comes with a text layer: the page's text runs, built from the page
+frame, laid out as transparent text over the bitmap at the same positions. A
+user can select and copy text in the preview. A click in the preview opens
+the source file at the clicked text, which Typst finds from the span of that
+text. A command in the editor and the palette jumps from the cursor to the
+matching place in the preview and scrolls it into view. The worker sends the
+text layer with the bitmap of the same page, so the two never disagree.
 
 When a compile takes longer than 10 s, the preview says "The preview is taking
 long" and offers "Restart preview", which ends the worker and starts a new
 one. The preview never switches silently to a server compile.
 
-### Why the previous preview could stay blank for minutes
+### Rules for the preview
 
-The previous preview chained several steps, and each had a long failure mode.
-It sent every file as one JSON string on each compile, compiled a PDF/A file,
-encoded it as base64, and rendered it with pdf.js. All loads shared one pdf.js
-worker port. A newer load destroyed the previous loading task without waiting
-for the destroy to finish (`void task.destroy()` in `pdf-viewer.ts`). A
-background compile on a typing pause and a manual compile could start loads at
-the same time. pdf.js does not accept a new document on a port while a destroy
-on that port is pending, and the viewer could then wait forever for a "ready"
-message. Separately, the browser compiler had a 120 s timeout, after which the
-client turned the browser compiler off and asked the server to compile. A
-first preview that hit both paths stayed blank for the timeout plus a full
-server compile, close to the 180 s users reported. This account comes from reading the previous code; the
-previous stack was not run to confirm the exact sequence. The new preview removes every step of
-that chain: there is no pdf.js, no PDF in the preview path, no base64, no
-whole-project JSON and no fallback timer.
+- The preview path has no PDF. The worker draws pages from the compiled
+  layout; only export makes a PDF.
+- At most one compile is in flight.
+- The preview never falls back to a server compile. A slow compile shows a
+  message and a restart button and stays in the browser.
 
 ### Export
 
@@ -627,14 +564,19 @@ An export option selects PDF/A-2b output. A compile that runs longer than
 
 ### Fonts
 
-Typst needs fonts. Today the WebAssembly module embeds the default Typst fonts,
-which makes it 45 MB, or 18 MB compressed. The design moves the fonts out of
-the module. The server serves each font as a separate file with a long cache
-lifetime, and the worker loads a font when a document first asks for its
-family. The fonts in the binary are the Typst defaults: Libertinus Serif, New
-Computer Modern and DejaVu Sans Mono. The administrator can add fonts to
-`DATA/fonts`. A project can carry its own font files, and the compiler adds
-any `.ttf`, `.otf` or `.woff2` file in the project.
+Typst needs fonts. The WebAssembly module holds none. The WASM build writes
+each font as its own file named by its hash, plus `fonts.json`, the catalogue
+of every font with its family, style and weight. The server embeds them with
+the web client and serves the font files with a one-year immutable cache
+lifetime; `fonts.json` is revalidated on each visit. The compiler starts with
+the catalogue only. When a compile needs a face whose data it lacks, it
+reports the face in `missing_fonts`. The worker fetches those files, adds
+them and compiles again, so a document downloads only the faces it uses. The
+server export loads fonts the same way from its embedded copy. The fonts are
+the Typst defaults: Libertinus Serif, New Computer Modern and DejaVu Sans
+Mono. The administrator can add fonts to `DATA/fonts`. A project can carry
+its own font files, and the compiler adds any `.ttf`, `.otf` or `.woff2` file
+in the project.
 
 ### Packages
 
@@ -654,25 +596,32 @@ that it is not available offline.
 
 ## 9. Web client
 
-### Vanilla TypeScript, not React
+### Solid for the interface
 
-The client stays in plain TypeScript, with no view framework. The most
-important parts of the client are imperative by nature: CodeMirror owns its
-DOM, the preview draws bitmaps into canvases, and two workers and a socket
-push events. A framework would wrap each of these and add a render cycle
-between the event and the screen. The remaining interface is a small number of
-screens, panels and dialogs.
+Screens, panels, dialogs, lists and the command palette use Solid
+(`solid-js`). The client has seven screens, seven panels and many lists that
+change while the user looks at them: files, people present, suggestions,
+threads, references, problems and checkpoints. Solid's fine-grained signals
+update the DOM nodes that read a value and nothing else. There is no
+virtual-DOM pass, so there is no render cycle between an event and the
+screen.
 
-The previous client's problem was a single 1,500-line `main.ts` that knew
-every feature, not the lack of a framework. The rebuilt client has one module
-per screen and per panel. Each module exports `mount(root, context)` and
-returns an `unmount` function. The context gives access to the session, the
-project's sync client and a small event bus. A 40-line `h()` helper builds DOM
-elements. The client drops the `effect` library, which is in beta and is used
-mainly for schema decoding. A few hand-written decoders replace it.
+CodeMirror, the preview canvases, the two workers and the sync client stay
+imperative modules. A Solid component creates each one in its element when
+it mounts and destroys it on cleanup. Sync and compile events become signals:
+the sync client sets the save state, the people present and the file list,
+the preview worker sets the pages and the problems, and components read those
+signals.
 
-If the dialogs grow (members, references, history), Preact is the fallback.
-It is small and can render into one panel without owning the rest of the page.
+The client has one module per screen and per panel. It has no `effect`
+library and no schema library.
+
+### HTTP API types
+
+The HTTP API types have one source, the Rust structs in `nisaba-server`.
+`ts-rs` generates the TypeScript types from them into
+`web/src/app/api.gen.ts`. The generated file is committed, and CI fails when
+it differs from what the server code generates.
 
 ### Screens
 
@@ -700,9 +649,7 @@ It is small and can render into one panel without owning the rest of the page.
 └──┴────────────┴──────────────────────────────┴──────────────────┴──┘
 ```
 
-The previous top bar had about ten controls: brand, location, search hint,
-people, References, History, Share, Export, presence, save state, Settings and
-Sign in. The new top bar has five. On the left are the way back to projects
+The top bar has five controls. On the left are the way back to projects
 and the project name, which opens a menu with Rename, Project settings,
 Download archive and Delete. Next is the open file's path. On the right are
 the save state, the people present, Share and Export.
@@ -796,38 +743,7 @@ Import limits: at most 500 MB uncompressed, 10,000 entries, and a compression
 ratio of at most 100 to 1 per entry. Paths are normalized. An entry with an
 absolute path, a `..` component or a duplicate path stops the import.
 
-## 11. Migration from the previous version
-
-The previous version kept text in two places, the sync service's op log and
-the app's document bodies, and these could disagree. The migration takes the
-sync service's state as the truth, because that is what users last saw in the
-editor.
-
-A one-off program, `migrate-legacy`, lives outside the new tree in a branch of
-the old code and is deleted after use. For each project it:
-
-1. signs in to the old app as a project owner and reads the project's file
-   list, assets and references through the old API;
-2. connects to the old sync service with protocol 2 and receives each
-   document's snapshot;
-3. takes each file's text from its document's `text` container, or from the
-   app's body when the sync service has no state for it;
-4. converts open suggestions from the old `review` map to `ins` and `del`
-   marks, and writes any suggestion it cannot place into `comments.json` as a
-   comment that quotes the suggested text;
-5. writes a project archive without `history.loro`.
-
-`nisaba import ARCHIVE --owner EMAIL` then loads each archive and makes an
-"Imported" checkpoint. Accounts do not migrate, because the old version kept
-passwords in its identity provider. The administrator invites each person to
-the projects they had. Old history does not migrate. The archives keep the
-state at migration time, and the old database dump stays available if someone
-needs an older version.
-
-The program reuses the old crates for protocol 2 and for decoding the review
-map, so it needs about 300 lines of new code.
-
-## 12. Performance targets
+## 11. Performance targets
 
 | Measure | Target | Measured |
 |---|---|---|
@@ -850,7 +766,7 @@ map, so it needs about 300 lines of new code.
 Each measured range covers three runs on a 12-core x86-64 workstation with headless
 Chromium, a release build, the server on a loopback address, and a fresh
 browser profile and data directory for each run. The test document is
-generated by `web/spike/fixture.mjs`: a field guide to rock pools in ten
+generated by `web/bench/fixture.mjs`: a field guide to rock pools in ten
 chapter files, with five SVG figures, five PNG figures, an outline and 60
 BibTeX entries cited throughout.
 
@@ -858,14 +774,14 @@ To reproduce:
 
 ```
 node scripts/build-wasm.mjs
-cd web && npx vite build --config spike/vite.config.ts && cd ..
+cd web && bun install --frozen-lockfile && bun run build && cd ..
 cargo build --release -p nisaba-server
-node web/spike/measure.mjs target/release/nisaba
-DPR=2 node web/spike/measure.mjs target/release/nisaba
+node web/bench/measure.mjs target/release/nisaba
+DPR=2 node web/bench/measure.mjs target/release/nisaba
 cargo test -p nisaba-server
 ```
 
-## 13. Out of scope
+## 12. Out of scope
 
 - Running more than one server process for one data directory, replication
   and high availability.
@@ -873,7 +789,9 @@ cargo test -p nisaba-server
   reverse proxy as a requirement.
 - Organizations and multi-tenancy.
 - Sending email.
-- DOCX import and export.
+- DOCX import. DOCX export is not in the first version; it comes through
+  [tabellion](https://github.com/nebu-tools/tabellion) once tabellion has a
+  release.
 - LaTeX and Markdown as source formats.
 - Search across projects on the server.
 - Trimming old history.
@@ -881,3 +799,22 @@ cargo test -p nisaba-server
 - Editing on phones. Phones can read, preview and comment.
 - Signing in for the first time while offline.
 - A plugin system.
+
+## 13. Build order
+
+- N2: `nisaba-server` is complete: accounts and sessions, projects, members,
+  rooms, compaction, backup, export, static files and the generated API types.
+- N3: the web client core: the sync client, the device log, the save states,
+  the preview worker and page view, the workspace shell, and the setup,
+  sign-in and projects screens.
+- N4: tracked changes and comments: the marks, the commenter check on the
+  server and the review panel.
+- N5: references through pinakes: the panel, import, duplicates,
+  `references.yml` and `@` completion.
+- N6: assets, fonts and the package cache, with the administration screen.
+- N7: checkpoints, history and restore.
+- N8: invitations, roles and OIDC.
+- N9: the project archive and close code 4409.
+- N10: the preview text layer and the jumps between source and preview.
+- N11: end-to-end tests of the whole product, and the performance table as a
+  CI check.
