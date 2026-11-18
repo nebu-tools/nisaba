@@ -759,7 +759,7 @@ absolute path, a `..` component or a duplicate path stops the import.
 | Server PDF export of the 28-page project | < 1 s | 0.29–0.41 s |
 | Update to Ack on a local network, 95th percentile | < 50 ms | not measured |
 | Room open, snapshot plus 500 log entries | < 100 ms | not measured |
-| First visit, compiler download on a 50 Mbit/s link | < 3 s | 18 MB today; fonts out of the module are needed |
+| First visit, compiler download on a 50 Mbit/s link | < 3 s | 7.8 MB module (brotli) plus the faces the document uses; about 1.3 s by size, not measured on a link |
 | Concurrent editors in one project | 20 | not measured |
 | Open projects on one server, 2 GB RAM | 200 | not measured |
 
