@@ -28,11 +28,19 @@ cargo test --workspace
 
 The server embeds `web/dist-server`, so build the web client before you test the server.
 
+The measurements in the pull request text come from a test that is off by default:
+
+```sh
+cargo test --release -p nisaba-server --test measure -- --ignored --nocapture
+```
+
 On Linux, `cargo test` includes `crates/nisaba-server/tests/sandbox.rs`, which fails on a kernel that cannot sandbox exports: one older than 6.2, or without Landlock or seccomp. It does not skip.
 
 ## Rules
 
-- `crates/nisaba-server/src/api.rs` defines the HTTP API types. When you change them, run `NISABA_WRITE_API=1 cargo test -p nisaba-server api` and commit `web/src/app/api.gen.ts`.
+- `crates/nisaba-server/src/api/` describes the HTTP API: `types.rs` holds the JSON bodies and `routes.rs` every route. When you change either, or a close code or limit, run `NISABA_WRITE_API=1 cargo test -p nisaba-server --lib api` and commit `api/openapi.json` and `web/src/app/api.gen.ts`. CI fails when they are stale.
+- A new route needs an entry in `routes.rs` and a handler in `crates/nisaba-server/src/http/mod.rs`; the conformance test `every_route_answers_as_described` then calls it.
+- Put a new fixed limit in `crates/nisaba-server/src/limits.rs`, and test it at its edge.
 - Add a test for each change in behaviour.
 - Commit no build output, `.env` files or secrets.
 

@@ -605,7 +605,7 @@
             "type": "string"
           },
           {
-            "const": "pdf-a2b",
+            "const": "pdf-a-2b",
             "description": "PDF/A-2b, for archiving.",
             "type": "string"
           }
@@ -3236,6 +3236,19 @@
               "invalid_request"
             ]
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
           "500": {
             "content": {
               "application/json": {
@@ -3314,6 +3327,19 @@
             "description": "Unauthorized",
             "x-nisaba-error-codes": [
               "not_signed_in"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
             ]
           },
           "500": {

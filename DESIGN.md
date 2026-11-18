@@ -35,13 +35,16 @@ The design follows five rules.
 11. Performance targets
 12. Out of scope
 13. Build order
+14. Running the server
 
 ## 1. Repository layout
 
 ```
+api/
+  openapi.json        the HTTP API and the sync protocol, generated (section 9)
 crates/
   nisaba-server/      the `nisaba` binary: HTTP, accounts, sync, storage,
-                      export, history, archive import and export
+                      export, backup, history, archive import and export
   nisaba-sync/        rooms and the wire protocol
   nisaba-compile-core/ LiveCompiler: incremental Typst compile, page
                       fingerprints, raster and PDF output
@@ -67,10 +70,16 @@ files.
 DATA/
   nisaba.db           SQLite in WAL mode
   nisaba.db-wal
+  nisaba.lock         held by the one server process that uses DATA
   assets/ab/cdef...   asset bytes, named by SHA-256
   fonts/              fonts the administrator adds
-  packages/           cached Typst packages, as .tar.gz
+  packages/           cached Typst packages, as preview/cetz-0.3.4.tar.gz
 ```
+
+One server process uses a data directory. At start it takes an exclusive
+lock on `nisaba.lock` and refuses to start while another process holds it.
+`nisaba setup` and `nisaba backup` work beside a running server without the
+lock; `nisaba restore` writes only into an empty directory.
 
 ### Why SQLite for the update log
 
@@ -93,24 +102,32 @@ and plain files are easy to copy, deduplicate and check.
 
 ### Tables
 
-| Table | Holds |
-|---|---|
-| `users` | id, email, display name, Argon2id password hash (nullable for OIDC-only users), `is_admin`, created time |
-| `identities` | OIDC issuer and subject linked to a user |
-| `sessions` | SHA-256 of the session token, user, expiry |
-| `invitations` | SHA-256 of the invitation token, project, role, creator, expiry, used time |
-| `projects` | id, name, entrypoint path, epoch, created and updated time |
-| `members` | project, user, role (`owner`, `editor`, `commenter`, `viewer`) |
-| `doc_updates` | project, sequence number, Loro update bytes |
-| `doc_snapshots` | project, Loro snapshot bytes |
-| `checkpoints` | project, id, name, Loro frontiers, author, time, kind (`manual`, `auto`, `restore`, `import`) |
-| `assets` | asset hash, size |
-| `project_assets` | project, asset hash: the assets uploaded to or imported into that project |
-| `settings` | key and value; holds the SHA-256 of the first-run setup code while one is open |
+| Table | Holds | Since |
+|---|---|---|
+| `users` | id, email, display name, Argon2id password hash (nullable for OIDC-only users), `is_admin`, created time | N2 |
+| `identities` | OIDC issuer and subject linked to a user | N8 |
+| `sessions` | SHA-256 of the session token, user, sign-in time, expiry | N2 |
+| `invitations` | SHA-256 of the invitation token, project, role, creator, expiry, used time | N8 |
+| `projects` | id, name, created time, time of the last change | N2 |
+| `members` | project, user, role (`owner`, `editor`, `commenter`, `viewer`) | N2 |
+| `doc_updates` | project, sequence number, Loro update bytes | N2 |
+| `doc_snapshots` | project, Loro snapshot bytes | N2 |
+| `checkpoints` | project, id, name, Loro frontiers, author, time, kind (`manual`, `auto`, `restore`, `import`) | N7 |
+| `assets` | asset hash, size | N2 |
+| `project_assets` | project, asset hash: the assets uploaded to or imported into that project | N2 |
+| `settings` | key and value; holds the SHA-256 of the first-run setup code while one is open | N2 |
 
-The connection uses `journal_mode=WAL`, `synchronous=FULL` and
-`foreign_keys=ON`. `synchronous=FULL` makes each commit durable before
-SQLite returns. The server acknowledges an update only after that return.
+The project's epoch comes with the archive import (N9), and its entrypoint
+with the choice of entry file; until then the entry file is `main.typ`.
+Every table that names a project deletes its rows with the project (`ON
+DELETE CASCADE`).
+
+The connection uses `journal_mode=WAL`, `synchronous=FULL`,
+`foreign_keys=ON` and `auto_vacuum=INCREMENTAL`. `synchronous=FULL` makes
+each commit durable before SQLite returns. The server acknowledges an update
+only after that return. Every write goes through one connection, under one
+lock; reads that may run beside a write (a room that opens, a list, a
+session) use a second, read-only connection.
 
 ### Writes
 
@@ -119,16 +136,41 @@ An update from a client goes through the project's room:
 1. The room checks that the bytes decode as a Loro update and that the
    sender's role allows the change.
 2. The room skips the update when the server already holds all of it.
-3. The room inserts the bytes into `doc_updates` and commits.
+3. The room inserts the bytes into `doc_updates` and commits. In the same
+   step, under the write lock, it asks the sender's grant again (section
+   4) and checks that the project still exists.
 4. The room imports the update into its in-memory document.
 5. The room sends the update to the other clients in the project.
 6. The room sends the sender an `Ack` with its version vector.
+
+A new project is one transaction: the project row, its owner, its asset
+rows and the first entry of its log, which holds its first files. The asset
+files are written and synced before it. A crash leaves the whole project or
+none of it.
+
+The server can be stopped at any point of a write. The test
+`a_crash_at_any_point_of_a_write_loses_nothing_acknowledged` kills it at
+each point (`crates/nisaba-server/src/crash.rs` lists them) and checks after
+a restart that every acknowledged update is there, that the update on its
+way is there once or not at all, and that the client's resend makes the
+server equal to the client. The test `a_torn_log_is_never_read_as_an_update`
+cuts the write-ahead log at every length inside its last transaction; each
+cut database opens and holds that transaction whole or not at all.
+
+When the disk is full, or a file size limit is reached, the write fails and
+nothing of it is kept. The room closes the socket with 4500 and sends no
+Ack; an upload or a new project gets HTTP 507. The server stays up and keeps
+serving what it has. The server handles `SIGXFSZ`, so a file size limit
+fails the write instead of ending the process.
 
 An asset upload writes the bytes to a temporary file, syncs it, renames it to
 its hash and syncs the directory. Then, in one transaction, it records the
 asset and a `project_assets` row for the project it was uploaded to. Only then
 does the server add the file entry to the Loro document. A crash can leave an
 unreferenced asset file, never a reference to a missing file.
+
+At start, before it takes requests, the server deletes asset files that no
+row refers to, and temporary files a crash left.
 
 An asset belongs to the projects that hold a `project_assets` row for it.
 Bytes are reachable only through such a project, by a member of it:
@@ -153,11 +195,16 @@ after a restart, because the room counts what the store holds.
 ### Compaction
 
 The room counts log entries and bytes since the last snapshot. After 500
-entries or 8 MiB, it exports a full snapshot. In one transaction the store
-writes the snapshot and deletes every log entry whose end version is inside
-the snapshot's version vector. An entry that arrived while the snapshot was
-being made stays in the log. Opening a room imports the snapshot and then the
-remaining log entries.
+entries or 8 MiB, it exports a full snapshot. It does this after it has
+queued the Ack of the update that made the compaction due, in a task of its
+own, and without the write lock, so no client waits for it and updates go
+on. Then, under the write lock, in one transaction the store writes the
+snapshot and deletes every log entry whose end version is inside the
+snapshot's version vector. An entry that arrived while the snapshot was
+being made stays in the log. Opening a room imports the snapshot and then
+the remaining log entries in one read transaction. A stored entry that does
+not import means the database was changed by hand or damaged; the room then
+refuses to open, rather than show a document without it.
 
 The snapshot keeps the full edit history. History is how checkpoints, version
 views and restores work, so the design never trims it. A busy project grows by
@@ -169,17 +216,40 @@ An asset file is deleted when no `project_assets` row refers to it. Rows go
 away only when a project is deleted. An asset that a file stopped using stays,
 because history can still show that file.
 
+### Deleting a project
+
+Only an owner deletes a project. In one transaction the store deletes the
+project row, which deletes its members, log, snapshot and asset rows with
+it, and the `assets` rows no other project holds. In the same step, under the
+write lock, it ends every sync grant of the project, so its sockets close
+with 4004 ("this project was deleted"). Then the server closes the room and
+forgets it, deletes the asset files no other project holds, and gives the
+freed database pages back to the file system (`PRAGMA incremental_vacuum`).
+A crash after the commit leaves files no row refers to; the next start
+deletes them.
+
 ### Backup and restore
 
 `nisaba backup DEST` writes a consistent copy while the server runs. It
-copies the database with SQLite's online backup API, then copies the asset,
-font and package files that are not already in `DEST`. The database copy comes
-first. Every asset the copied database refers to was on disk before the
-database row that refers to it, so the copy is complete. A second run copies
-only new assets.
+copies the database with SQLite's online backup API in one step, which is
+one read transaction and so one moment of the database, while the server
+goes on writing. Then it copies the asset, font and package files that are
+not already in `DEST`. The database copy comes first. Every asset the copied
+database refers to was on disk before the database row that refers to it,
+so the copy is complete. A second run copies only new files. Each file is
+written under a temporary name, synced and renamed, and each asset is checked
+against its hash, so a damaged asset stops the backup instead of being
+copied. A backup is itself a data directory.
 
-To restore, stop the server, replace the data directory with the backup and
-start the server. Clients that hold edits made after the backup still have
+`nisaba restore BACKUP` copies a backup into the data directory, which must
+not exist or be empty; it never writes over data. It checks the database
+with `PRAGMA integrity_check`, every asset against its hash, and that every
+project's document loads, in a directory beside the target, and moves that
+directory into place only when every check passed. Stop the server first.
+The test `a_backup_under_writes_restores_every_project` backs up while four
+clients write, restores into an empty directory, and compares every project.
+
+Clients that hold edits made after the backup still have
 them in IndexedDB. When they reconnect, the server's version vector shows that
 it lacks those edits, and the clients send them again. A restore from backup
 therefore loses only edits that no open client still holds.
@@ -264,16 +334,29 @@ reason (below), so there is no error frame and no goodbye frame. A frame with
 an unknown type, a short frame or bytes after the end of a frame closes the
 socket with 4000.
 
-A socket belongs to the session that opened it. The server closes it at once
-when that access ends: with 4401 when the session is signed out, expires or
-its account is deleted, and with 4004 when the user stops being a member of
-the project. The store ends the socket's grant in the same step that takes
-the access away. The room asks the grant again when it writes an update,
-inside the store's lock under which access ends, so an update that waited
-for the lock while access ended is not written, not sent on and not
-acknowledged. The socket loop also checks the grant before each frame and
-while it waits to send one. Expiry is checked during
-the socket's life, at least once a minute.
+A socket belongs to the session that opened it, and holds a grant that
+carries the user's role in the project. The store changes or ends the grant
+in the same step, under the same write lock, that changes the access:
+
+| Change | Effect on the socket |
+|---|---|
+| Sign-out, sign-out everywhere, a password change in another session, the account deleted | closed with 4401 |
+| The session expires | closed with 4401, within a minute |
+| The user is removed from the project, or the project is deleted | closed with 4004 |
+| The role changes so that the user may no longer write | closed with 4003 |
+| The role changes otherwise, as from viewer to editor | stays open; the next update follows the new role |
+| The session is renewed | stays open until the new end |
+
+The close frame's reason says which change it was, such as "your session
+expired" or "you are no longer a member of this project". The room asks the
+grant again when it writes an update, inside the store's lock under which
+access changes, so an update that waited for the lock while access ended or
+the role dropped is not written, not sent on and not acknowledged. The
+socket loop also checks the grant before each frame and while it waits to
+send one. Expiry is checked during the socket's life, at least once a minute.
+
+When the server stops, each socket closes with 1012 between two frames, so
+an update the server has received is written and acknowledged first.
 
 The session cookie authenticates the socket. The server refuses the upgrade
 with HTTP 403 unless the `Origin` header equals the public address (section
@@ -349,24 +432,31 @@ In the unsafe state the page asks for confirmation before it closes.
 |---|---|---|
 | 1000 | Normal close | Reconnect when the page needs the project again. |
 | 1006 | Connection lost | Reconnect with backoff. |
-| 4000 | Malformed frame, or parts out of order | Reconnect with backoff. After three in a row with no Ack between them, stop and show "Sync failed" with a Reload button. |
-| 4004 | Unknown project, or the user is not a member, or stopped being one | Stop; the save state says "Stopped" with the reason. |
+| 1012 | The server is stopping; it finished every update it had received | Reconnect with backoff. |
+| 4000 | Malformed frame, or parts out of order, or a Presence frame over 64 KiB | Reconnect with backoff. After three in a row with no Ack between them, stop and show "Sync failed" with a Reload button. |
+| 4004 | Unknown project, or the user is not a member, was removed, or the project was deleted | Stop; the save state says "Stopped" with the reason. |
 | 1013 | Try again later: the server holds too many large updates in parts at once, or an unfinished one holds the space this update needs in its project | Reconnect with backoff and send again. |
 | 4002 | Too slow | The client did not read its frames: its queue on the server filled, or one frame waited 30 s to be sent. Reconnect with backoff. |
 | 4008 | An update in parts did not finish before its deadline | Reconnect with backoff and send again. |
-| 4003 | Not allowed | Planned: reload the role and continue read-only. Today the client stops as for 4004. Local changes stay in IndexedDB. |
+| 4003 | Not allowed: the role does not allow the update, or changed so that the user may no longer write | Reload the role and continue read-only. Local changes stay in IndexedDB. |
 | 4029 | Too many connections: the project has too many sockets, or the account has 32 open | Reconnect with backoff. |
 | 4130 | The update, or its declared length, does not fit beside what the project stores, under its 32 MiB | Stop; do not retry. The save state says "Not saved: the project is full", and a note says that the edits are kept on this device and that copying the text into a new project lets the user go on. |
 | 4400 | Protocol version mismatch | Show "Nisaba was updated. Reload to continue." Local changes stay in IndexedDB and go out after the reload. |
-| 4401 | No valid session: never had one, signed out, expired, or the account was deleted | Stop; the save state says "Stopped" with the reason. A reload shows the sign-in screen. Local changes stay in IndexedDB. |
+| 4401 | No valid session: never had one, signed out, signed out everywhere, expired, ended by a password change in another session, or the account was deleted | Stop; the save state says "Stopped" with the reason. A reload shows the sign-in screen. Local changes stay in IndexedDB. |
 | 4409 | Project replaced | Planned with the archive (section 10): offer the unsent changes as a download, then clear the device log and reload. |
-| 4500 | Server error | Reconnect with backoff. |
+| 4500 | Server error, such as a full disk; nothing of the update was kept | Reconnect with backoff. |
+
+`nisaba_sync::close::ALL` holds this table; the API description and the
+client's `Close` constant are made from it. No other code is sent; the
+close code 4091 of the old server does not exist.
 
 Backoff starts at 0.5 s, doubles to 30 s and has random jitter. It goes back
 to 0.5 s only on an Ack, or on a Welcome when the client has nothing to send,
 so a client whose update keeps failing waits longer each time. The server
-closes with a 2 s limit on the close frame, so a client that reads nothing
-cannot hold its socket open. The client
+closes with a 2 s limit on the close frame: it sends the frame and reads,
+discarding, until the client answers it, so frames the client sent are not
+left unread, which would end the connection with a TCP reset that can hide
+the close code. A client that reads nothing cannot hold its socket open. The client
 sends a Heartbeat every 20 s and the server answers with one. The server
 closes a socket that sends nothing for 60 s.
 
@@ -419,7 +509,10 @@ suggested insertions and suggested deletions both present. "With suggestions
 applied" removes `del` text and keeps `ins` text. "Original" removes `ins`
 text and keeps `del` text. Each view is a short function over the text and its
 marks. The server and the client each have one copy of it, and a shared test
-fixture keeps the two copies equal.
+fixture keeps the two copies equal. The server's copy is
+`project::text_in_view`, which the export's `view` parameter uses, and the
+fixture is `crates/nisaba-server/tests/fixtures/views.json`; the client's
+copy comes with N4.
 
 ### Comments
 
@@ -504,29 +597,56 @@ owner out, and 128 bits cannot be guessed.
 The first account is the server administrator. Without the code, a stranger
 on the same network could take the server before its owner does.
 
+`nisaba setup --email E` makes the first account from the terminal of the
+server's machine. It reads the password from standard input, needs no setup
+code, works beside a running server, and refuses when an account exists.
+
 ### Local accounts
 
-Passwords use Argon2id with the `argon2` crate's default parameters. At most
+Passwords use Argon2id with the `argon2` crate's default parameters: 19 MiB
+of memory, 2 passes, 1 lane. The settings `passwords.memory_kib` and
+`passwords.iterations` raise them, never below the defaults. A hash stores
+the parameters it was made with, so a hash made before a raise still
+verifies; when it does, the sign-in stores a new hash of the same password
+with the current parameters. The test
+`a_hash_from_today_is_rehashed_when_the_parameters_rise` checks both. A
+password has 8 to 1024 bytes and at least 8 characters. At most
 four hashes run at once, on blocking threads, and at most 16 more requests
 wait for one. A request beyond that gets 503 with `Retry-After: 1` at once.
-A sign-in for an unknown email checks the password against a fixed hash, so
-both cases take the same time.
+A sign-in for an unknown email checks the password against a fixed hash made
+with the same parameters, so both cases take the same time.
 
 The server stores a session as the SHA-256 of a random 32-byte token. Behind
 an https public address the browser holds the token in a cookie named
 `__Host-nisaba_session` with `Secure`, `HttpOnly`, `SameSite=Lax` and
 `Path=/`; the `__Host-` prefix makes the browser refuse it unless it is
 secure, has that path and names no domain. Behind plain http the cookie is
-`nisaba_session` with the same attributes except `Secure`. Sessions last 30
-days from sign-in. Signing out deletes the session row and closes the
-session's sync sockets (section 4); making a session deletes the expired
-ones.
+`nisaba_session` with the same attributes except `Secure`. The cookie's
+`Max-Age` is the time left until the session ends.
+
+A session ends 30 days after its last renewal and never later than 90 days
+after sign-in. `GET /api/session` renews it, at most once a day: it moves
+the end to 30 days from now, or to the 90-day mark if that comes first, and
+sends the cookie again. The client calls that route when it starts and at
+least once a day while it stays open, so a person who uses Nisaba signs in
+again once in 90 days, and a session nobody uses ends after 30. Renewal
+moves the end of the session's open sync sockets too. No other route renews
+a session.
+
+Signing out deletes the session row and closes the session's sync sockets
+(section 4). Signing out everywhere (`POST /api/logout-everywhere`) does that
+for every session of the account. A password change needs the current
+password, counts a wrong one as a failed sign-in of the account's email
+(below), and ends every other session of the account; the session that made
+the change stays. Making a session deletes the expired ones.
 
 Every request other than `GET` and `HEAD` must carry an `Origin` header equal
 to the public address, or the server answers 403. Browsers send `Origin` on
 every such request, so a page of another site cannot make one with the
 user's cookie, and `SameSite=Lax` keeps the cookie off cross-site
-subrequests. There are no separate CSRF tokens. `GET` routes change nothing.
+subrequests. There are no separate CSRF tokens. `GET` routes change nothing a
+page of another site could want: the only writes a `GET` makes are the
+renewal of the caller's own session and a package added to the cache.
 
 Failed sign-ins slow down the email they were for. The first three cost
 nothing. After that the next attempt must wait 1 s, then 2 s, 4 s and so on
@@ -540,7 +660,22 @@ SECURITY.md says to put a rate limit in the reverse proxy for that.
 
 Other limits: a request body may be 64 KiB, an asset upload 32 MiB and a
 project import 64 MiB (413 beyond). An account may hold 32 sync sockets at
-once; the next one is closed with 4029.
+once; the next one is closed with 4029. A project may have 64 sockets open
+at once; the next one is closed with 4029. A display name has 1 to 100
+characters, a project name 1 to 200, an email at most 254 bytes, and a file
+path in a project at most 512 bytes, relative, with no empty part, no `.`
+and no `..`. `crates/nisaba-server/src/limits.rs` holds every fixed limit,
+and the API description lists them under `x-nisaba-limits`.
+
+### Accounts
+
+Until invitations exist (N8), the administrator makes accounts:
+`POST /api/admin/users` with an email, a name and a first password, which
+the person changes after signing in. The administrator lists accounts and
+deletes one. Deleting an account deletes its sessions and memberships and
+closes its sync sockets with 4401. The server refuses to delete the last
+administrator, and an account that is the only owner of a project, until
+its projects are deleted or have another owner.
 
 ### Roles
 
@@ -556,6 +691,16 @@ once; the next one is closed with 4029.
 
 The server administrator manages accounts and server settings. Being an
 administrator gives no access to projects.
+
+All four roles exist from N2. Until build step N4 adds the check of
+suggestions, the room refuses every update from a commenter, so a commenter
+reads like a viewer. An owner adds a member by the email of an existing
+account, with a role, changes a member's role, and removes a member; any
+member may remove themself. A project always keeps an owner: the server
+refuses to remove or demote the last one (409). An owner may make another
+member an owner. Section 4 says what each change does to an open socket:
+it takes effect at once. Adding by email tells an owner whether an account
+has that email; SECURITY.md says so.
 
 ### Invitations
 
@@ -614,13 +759,15 @@ recompiles only what it affects.
 ```rust
 impl LiveCompiler {
     pub fn new(entry: &str, fonts: &[FontEntry]) -> Result<Self, String>; // catalogue only, no font data
-    pub fn add_font(&mut self, index: usize, data: Vec<u8>);
+    pub fn add_font(&mut self, index: usize, data: Vec<u8>) -> Result<(), String>;
+    pub fn add_font_file(&mut self, data: Vec<u8>) -> usize; // a font outside the catalogue
+    pub fn add_package(&mut self, spec: &str, files: Vec<(String, Vec<u8>)>) -> Result<(), String>;
     pub fn set_today(&mut self, year: i32, month: u8, day: u8);
     pub fn write(&mut self, path: &str, contents: FileContents); // Text or Bytes
     pub fn remove(&mut self, path: &str);
-    pub fn compile(&mut self) -> Compiled; // page hashes, sizes, problems, missing fonts
+    pub fn compile(&mut self) -> Compiled; // page hashes, sizes, problems, missing fonts and packages
     pub fn page_rgba(&self, index: usize, pixel_per_pt: f32) -> Option<(u32, u32, Vec<u8>)>;
-    pub fn pdf(&self) -> Result<Vec<u8>, String>;
+    pub fn pdf(&self, kind: PdfKind) -> Result<Vec<u8>, String>; // Plain or A2b
 }
 ```
 
@@ -738,9 +885,11 @@ equal byte for byte.
 
 ### Export
 
-`GET /api/projects/{id}/export.pdf?today=YYYY-MM-DD` reads the files from
-the project's room, resolves the assets the project holds, and compiles them
-in a child process. The server keeps no compilers between exports. Typst's PDF
+`GET /api/projects/{id}/export.pdf?today=YYYY-MM-DD&view=written&standard=pdf`
+reads the files from the project's room in the asked view (section 5),
+resolves the assets the project holds and the packages its files import,
+and compiles them in a child process with every font the server holds.
+`standard=pdf-a-2b` asks for PDF/A-2b, dated by the `today` the export uses. The server keeps no compilers between exports. Typst's PDF
 output depends only on its input, so the export equals, byte for byte, a
 compile of the same files anywhere else. The test
 `export_reads_the_same_state_as_sync` checks this: it edits through sync,
@@ -822,7 +971,7 @@ The server answers:
 | Outcome | Status | Message |
 |---|---|---|
 | PDF | 200 | |
-| Compile problems | 422 | the problems |
+| Compile problems | 422 | `compile_failed`, with the problems as `problems`, each with its file and range |
 | Allocation failed or `SIGKILL`/`SIGABRT` | 422 | "the export ran out of memory: …" with the limit |
 | Deadline passed or `SIGXCPU` | 422 | "the export ran out of time: …" with the limit |
 | All slots and the queue full | 503 with `Retry-After: 30` | "the server is busy with other exports; try again in a minute" |
@@ -853,7 +1002,9 @@ survives any document, but none of the four promises holds and there is no
 memory limit: a document that allocates without end can exhaust the
 machine's memory before the deadline.
 
-An export option for PDF/A-2b output is planned.
+An export may ask for PDF/A-2b (`standard=pdf-a-2b`). The file is dated
+with the export's date at midnight UTC, so it too is the same byte for byte
+for the same files on the same day.
 
 ### Fonts
 
@@ -867,17 +1018,28 @@ reports the face in `missing_fonts`. The worker fetches those files, adds
 them and compiles again, so a document downloads only the faces it uses. The
 server export adds every font from its embedded copy before it compiles.
 The fonts are the Typst defaults: Libertinus Serif, New Computer Modern and DejaVu Sans
-Mono. The administrator can add fonts to `DATA/fonts`. A project can carry
-its own font files, and the compiler adds any `.ttf`, `.otf` or `.woff2` file
-in the project.
+Mono. The administrator can add fonts to `DATA/fonts`. At start the server
+reads every `.ttf`, `.otf`, `.ttc` and `.otc` file there, names it by a hash
+of its bytes, and adds its faces to the catalogue it serves as
+`/fonts/fonts.json`, revalidated by its `ETag`; a file Typst cannot read is
+left out with a warning in the log, and a font added later counts from the
+next start. The export sends the child every added font with its request. A
+project can carry its own font files, and the export adds any `.ttf`,
+`.otf`, `.ttc` or `.otc` file in the project; Typst reads no WOFF or WOFF2.
 
 ### Packages
 
 A document can import packages from the Typst package registry, such as
-`@preview/cetz:0.3.4`. The server answers `GET /packages/{namespace}/{name}/{version}.tar.gz`
-from `DATA/packages`. On a cache miss, and if the administrator allows
-network access, it downloads the package from the registry, checks its size,
-and stores it. The browser worker asks the server for a package the first
+`@preview/cetz:0.3.4`. The server answers `GET /packages/{namespace}/{name}/{version}.tar.gz`,
+to a signed-in person, from `DATA/packages`. On a cache miss, and if the
+administrator allows network access (`packages.download`, on unless the
+server is started with `--no-package-downloads`), it downloads the package
+from the registry (`packages.registry`, `https://packages.typst.org`) within
+30 s, checks that the archive has at most 16 MiB and unpacks to at most
+64 MiB and 4096 files with no path that leaves the package and a
+`typst.toml`, and stores it under a temporary name, synced and renamed. Two
+requests for one missing package share one download. A package the registry
+lacks is 404; a registry that cannot be reached is 502. The browser worker asks the server for a package the first
 time a compile reports it missing, unpacks it into the compiler, and keeps
 the archive in IndexedDB. The server export uses the same cache.
 
@@ -885,7 +1047,13 @@ Offline, a client can use every package it has cached, and the server can use
 every package in `DATA/packages`. `nisaba packages add @preview/cetz:0.3.4`
 fills the cache ahead of time for servers without network access. A package
 that is not available gives a compile problem that names the package and says
-that it is not available offline.
+that it is not available.
+
+The export finds the packages a project needs by reading every
+`@namespace/name:version` in its `.typ` files, and then in the `.typ` files
+of those packages, at most 64 in all. A name in a comment counts too;
+loading one package more than needed costs nothing but the download. The
+compiler gets each package's files with `LiveCompiler::add_package`.
 
 ## 9. Web client
 
@@ -911,10 +1079,64 @@ library and no schema library.
 
 ### HTTP API types
 
-The HTTP API types have one source, the Rust structs in `nisaba-server`.
-`ts-rs` generates the TypeScript types from them into
-`web/src/app/api.gen.ts`. The generated file is committed, and CI fails when
-it differs from what the server code generates.
+The HTTP API and the sync protocol have one description, `api/openapi.json`,
+an OpenAPI 3.1 document. The server makes it from its own code: the JSON
+bodies are Rust types in `crates/nisaba-server/src/api/types.rs`, whose JSON
+Schemas `schemars` writes; every route is an entry of the table in
+`api/routes.rs` with its method, path, who may call it, its body and its
+limit, its answers and its error codes; and the frames, the close codes
+(section 4) and the fixed limits come from `nisaba-sync` and `limits.rs`
+under the keys `x-nisaba-sync` and `x-nisaba-limits`. The router registers
+its handlers by the entries of that table, so a route cannot exist without
+being described. The TypeScript in `web/src/app/api.gen.ts` is made from the
+description alone: a type for each schema, `ERROR_STATUS`, `Close`,
+`FrameType`, `PROTOCOL`, `PART`, `LIMITS`, and `Routes` and `ROUTES`, which
+give each route's method, path, query, body, answers and error codes. Both
+files are committed, and CI fails when either differs from what the server
+code makes. `nisaba api` prints the description.
+
+Every error is one JSON shape, `ApiError`: a stable `code` the client may
+branch on, a `message` a person can read, and, when they apply, the request
+`field` it is about, `retry_after` in seconds (also sent as `Retry-After`),
+and the `problems` of a failed export. The description lists each code with
+its HTTP status and meaning, and each route with the codes it may send. This
+holds also when axum refuses a body, a query, a path or a method, and when a
+handler panics. The test `every_route_answers_as_described` walks the
+description and calls every route on the real binary with valid input and
+with each kind of invalid input the description implies, and checks every
+answer against the schemas.
+
+### Serving the client
+
+The server embeds the built client and serves it. Files under `/assets/` and
+`/fonts/` carry a content hash in their name and are kept for a year
+(`immutable`); every other file, `index.html` and `fonts.json` among them, is
+revalidated by an `ETag` made from its SHA-256, and a matching
+`If-None-Match` gets 304. A path that names no file gets `index.html`, so
+the client can route it, except under `/api/`, `/sync/`, `/packages/`,
+`/fonts/` and `/assets/`, where it is a 404 in the error shape. The build
+writes a Brotli and a gzip copy beside each large file, and the server sends
+the one the request takes; JSON and text answers of the API are compressed
+on the fly the same way. An asset of a project and a font file take one
+byte range (`Range: bytes=a-b`), answered with 206, or 416 when it lies past
+the end. A server built without the client answers its pages with 503
+`web_client_missing` and a sentence that says how to build it; the API works
+without it.
+
+Every answer, an error too, carries these headers:
+
+| Header | Value |
+|---|---|
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`; an asset gets `sandbox` instead |
+| `X-Content-Type-Options` | `nosniff` |
+| `Referrer-Policy` | `no-referrer` |
+| `X-Frame-Options` | `DENY` |
+| `Cross-Origin-Opener-Policy` | `same-origin` |
+| `Cross-Origin-Resource-Policy` | `same-origin` |
+| `Permissions-Policy` | camera, microphone, geolocation, payment and USB off |
+| `Strict-Transport-Security` | `max-age=31536000`, behind an https public address only |
+
+API answers carry `Cache-Control: no-store` unless they set their own.
 
 ### Screens
 
@@ -1052,15 +1274,18 @@ absolute path, a `..` component or a duplicate path stops the import.
 | Incremental compile of one changed chapter | < 80 ms | 61–66 ms (median) |
 | Raster of one A4 page in the worker, pixel ratio 1 / 2 | < 30 ms | 9 / 25 ms |
 | Server PDF export of the 28-page project | < 1 s | 0.29–0.41 s |
-| Update to Ack on a local network, 95th percentile | < 50 ms | not measured |
-| Room open, snapshot plus 500 log entries | < 100 ms | not measured |
+| Update to Ack on a local network, 95th percentile | < 50 ms | 5.0–5.9 ms over loopback (see below) |
+| Room open, snapshot plus 500 log entries | < 100 ms | 8.1–8.7 ms for a snapshot of 1 MiB of text and 499 entries (see below) |
 | First visit, compiler download on a 50 Mbit/s link | < 3 s | 7.8 MB module (brotli) plus the faces the document uses; about 1.3 s by size, not measured on a link |
 | Concurrent editors in one project | 20 | not measured |
 | Open projects on one server, 2 GB RAM | 200 | not measured |
 
 Each measured range covers three runs on a 12-core x86-64 workstation with headless
 Chromium, a release build, the server on a loopback address, and a fresh
-browser profile and data directory for each run. The test document is
+browser profile and data directory for each run. The two server rows were
+measured in build step N2 by `crates/nisaba-server/tests/measure.rs` on a
+release build, in two runs on a shared 24-thread machine whose load average
+was 14 to 31 at the time, so they are indications only. The test document is
 generated by `web/bench/fixture.mjs`: a field guide to rock pools in ten
 chapter files, with five SVG figures, five PNG figures, an outline and 60
 BibTeX entries cited throughout.
@@ -1113,3 +1338,76 @@ cargo test -p nisaba-server
 - N10: the preview text layer and the jumps between source and preview.
 - N11: end-to-end tests of the whole product, and the performance table as a
   CI check.
+
+## 14. Running the server
+
+### Commands
+
+| Command | Does |
+|---|---|
+| `nisaba serve` | runs the server |
+| `nisaba check` | prints every setting, checks that the server could start with them (the public address, the data directory, the fonts), says whether exports are sandboxed and whether the client is built in; exits with 1 when something would stop the server |
+| `nisaba setup --email E [--name N]` | makes the first account (section 6) |
+| `nisaba backup DEST` | copies the data directory while the server runs (section 2) |
+| `nisaba restore BACKUP` | copies a backup into an empty data directory (section 2) |
+| `nisaba packages add SPEC...` | fills the package cache (section 8) |
+| `nisaba api` | prints `api/openapi.json` |
+| `nisaba help`, `nisaba version` | |
+
+The hidden command `__export` is the export child (section 8).
+
+### Settings
+
+Every setting has a key, and can be given in a TOML file, in the
+environment, or on the command line; each later one wins. The key
+`export.memory_mb` is `memory_mb` under `[export]` in the file,
+`NISABA_EXPORT_MEMORY_MB` in the environment and `--export-memory-mb` on the
+command line. `--config FILE` or `NISABA_CONFIG` names the file. An unknown
+key in the file or an unknown flag is an error, so a typo does not pass
+unseen. `nisaba help` lists every setting.
+
+| Key | Flag | Default |
+|---|---|---|
+| `data` | `--data` | `nisaba-data` |
+| `listen` | `--listen` | `127.0.0.1:8080` |
+| `public_url` | `--public-url` | the listen address, when it is loopback |
+| `allow_insecure_http` | `--allow-insecure-http` | off |
+| `log_format` | `--log-format` | `text`; or `json` |
+| `export.memory_mb`, `export.seconds`, `export.parallel`, `export.queue` | `--export-...` | 1024, 60, 2, 8 (section 8) |
+| `export.allow_unsandboxed` | `--allow-unsandboxed-export` | off |
+| `sync.transfer_mb` | `--sync-transfer-mb` | 256 (section 4) |
+| `packages.download` | `--no-package-downloads` turns it off | on |
+| `packages.registry` | `--package-registry` | `https://packages.typst.org` |
+| `passwords.memory_kib`, `passwords.iterations` | `--password-...` | 19456, 2 (section 6) |
+
+### Logs
+
+The server writes its log to standard error, as text or as one JSON object
+per line. `RUST_LOG` picks the level; the default is `info`. A request is
+logged by its method and path, without the query, at `debug` level, and at
+`warn` when the server failed it. People are logged by their account id.
+No log line holds a password, a session token, an email address, a file
+name from a query, or document text; an export child's output may quote the
+document, so a failed export is logged only as failed. The test
+`the_logs_hold_no_private_data` checks this at the most detailed level.
+
+### Health
+
+`GET /api/health` answers 200 with `"status": "ok"` while the server can read
+its database, and 503 with `failing` when it cannot or `stopping` while it
+stops, so a load balancer stops sending it requests. It also says whether
+the client is built in and whether exports are sandboxed. It needs no
+session.
+
+### Stopping
+
+On `SIGTERM` or Ctrl-C the server stops taking connections, answers the
+health check with 503, ends every export (section 8), and closes each sync
+socket with 1012 after the frame it is on, so an update that has arrived is
+written and acknowledged. It waits at most 5 s for open requests and
+sockets, then for each room to finish the write or compaction it is in,
+then folds the write-ahead log into the database file
+(`PRAGMA wal_checkpoint(TRUNCATE)`), and exits with 0. The test
+`stopping_finishes_the_writes_it_has` sends 40 updates, stops the server
+at once, and checks the close code, the exit status, the empty log and that
+every acknowledged update is saved.

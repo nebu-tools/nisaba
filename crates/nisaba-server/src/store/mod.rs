@@ -295,29 +295,6 @@ impl Store {
         })
     }
 
-    /// The path of the database file.
-    #[must_use]
-    pub fn database_path(&self) -> PathBuf {
-        self.inner.dir.join("nisaba.db")
-    }
-
-    /// Copies the database, as one consistent read, to `dest`, with
-    /// `SQLite`'s online backup. Writers go on meanwhile.
-    pub fn backup_database(&self, dest: &Path) -> StoreResult<()> {
-        let conn = Connection::open_with_flags(
-            self.database_path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        let mut out = Connection::open(dest)?;
-        {
-            let backup = rusqlite::backup::Backup::new(&conn, &mut out)?;
-            // All pages in one step: one read transaction, so one moment.
-            backup.step(-1)?;
-        }
-        out.execute_batch("PRAGMA journal_mode = DELETE;")?;
-        Ok(())
-    }
-
     /// Which project ids exist, for backup checks and tools.
     pub fn project_ids(&self) -> StoreResult<Vec<String>> {
         self.read(|c| {

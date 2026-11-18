@@ -30,24 +30,49 @@ pub fn built() -> bool {
     WebClient::get("index.html").is_some()
 }
 
-/// Paths that are never the client's pages: a miss there is a 404.
+/// Paths that are never the client's pages: a miss there is a 404, not
+/// `index.html`.
 const NOT_PAGES: &[&str] = &["api/", "sync/", "packages/", "fonts/", "assets/"];
+
+/// One file of the web client: its bytes and the SHA-256 of the plain file.
+pub struct File {
+    pub data: Cow<'static, [u8]>,
+    pub sha256: [u8; 32],
+}
+
+fn embedded(path: &str) -> Option<File> {
+    WebClient::get(path).map(|f| File {
+        sha256: f.metadata.sha256_hash(),
+        data: f.data,
+    })
+}
 
 /// Serves one file of the web client. Paths that name no file get
 /// `index.html`, so the client can route them, except under [`NOT_PAGES`].
 pub async fn static_file(method: Method, headers: HeaderMap, uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    if NOT_PAGES.iter().any(|p| path.starts_with(p))
-        || !matches!(method, Method::GET | Method::HEAD)
-    {
-        return Fail::new(ErrorCode::NotFound, "nothing is at this address").into_response();
+    page(&method, &headers, uri.path(), embedded)
+}
+
+/// [`static_file`] with the files `lookup` finds.
+pub fn page(
+    method: &Method,
+    headers: &HeaderMap,
+    path: &str,
+    lookup: impl Fn(&str) -> Option<File>,
+) -> Response {
+    let path = path.trim_start_matches('/');
+    let not_found = || Fail::new(ErrorCode::NotFound, "nothing is at this address").into_response();
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return not_found();
     }
-    let path = if path.is_empty() || WebClient::get(path).is_none() {
-        "index.html"
-    } else {
+    let path = if !path.is_empty() && lookup(path).is_some() {
         path
+    } else if NOT_PAGES.iter().any(|p| path.starts_with(p)) {
+        return not_found();
+    } else {
+        "index.html"
     };
-    let Some(plain) = WebClient::get(path) else {
+    let Some(plain) = lookup(path) else {
         return Fail::new(
             ErrorCode::WebClientMissing,
             "this server was built without the web client: run `bun run build` in web/ and \
@@ -55,16 +80,16 @@ pub async fn static_file(method: Method, headers: HeaderMap, uri: Uri) -> Respon
         )
         .into_response();
     };
-    let etag = format!("\"{}\"", &hex(&plain.metadata.sha256_hash())[..32]);
+    let etag = format!("\"{}\"", &hex(&plain.sha256)[..32]);
     let hashed = path.starts_with("assets/");
-    if !hashed && matches_etag(&headers, &etag) {
+    if !hashed && matches_etag(headers, &etag) {
         return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
     }
-    let accepts = accepted(&headers);
+    let accepts = accepted(headers);
     let (coding, file) = [("br", "br"), ("gzip", "gz")]
         .into_iter()
         .filter(|(coding, _)| accepts.contains(coding))
-        .find_map(|(coding, ext)| Some((Some(coding), WebClient::get(&format!("{path}.{ext}"))?)))
+        .find_map(|(coding, ext)| Some((Some(coding), lookup(&format!("{path}.{ext}"))?)))
         .unwrap_or((None, plain));
     let cache = if hashed {
         "public, max-age=31536000, immutable"
@@ -172,6 +197,28 @@ mod tests {
             HeaderValue::from_static("gzip;q=0.5, br;q=0, deflate"),
         );
         assert_eq!(accepted(&headers), ["gzip", "deflate"]);
+    }
+
+    /// A server built without the client says so on every page, and its
+    /// other paths still answer as they would.
+    #[test]
+    fn a_server_without_the_client_says_so() {
+        let none = |_: &str| None;
+        let res = page(&Method::GET, &HeaderMap::new(), "/", none);
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let res = page(&Method::GET, &HeaderMap::new(), "/projects/kelp", none);
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let res = page(&Method::GET, &HeaderMap::new(), "/api/nothing", none);
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let one = |p: &str| {
+            (p == "index.html").then_some(File {
+                data: Cow::Borrowed(b"<html>"),
+                sha256: [7; 32],
+            })
+        };
+        let res = page(&Method::GET, &HeaderMap::new(), "/projects/kelp", one);
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "no-cache");
     }
 
     #[test]

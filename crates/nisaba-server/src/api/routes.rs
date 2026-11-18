@@ -553,7 +553,7 @@ pub const ROUTES: &[Route] = &[
         body: Body::None,
         ok: (200, Reply::Bytes("application/gzip")),
         also: &[],
-        errors: &[E::PackageUnavailable],
+        errors: &[E::NotFound, E::PackageUnavailable],
         example: None,
     },
     Route {
@@ -580,7 +580,7 @@ pub const ROUTES: &[Route] = &[
         body: Body::None,
         ok: (200, Reply::Bytes("font/ttf")),
         also: &[],
-        errors: &[],
+        errors: &[E::NotFound],
         example: None,
     },
     Route {

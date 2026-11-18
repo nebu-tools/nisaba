@@ -406,6 +406,19 @@ pub mod tests {
     }
 
     #[test]
+    fn a_package_of_too_many_files_is_refused() {
+        let names: Vec<String> = (0..PACKAGE_FILES_MAX)
+            .map(|i| format!("f{i}.typ"))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = vec![("typst.toml", b"")];
+        files.extend(names.iter().map(|n| (n.as_str(), &b""[..])));
+        let err = unpack(&archive(&files)).unwrap_err();
+        assert!(err.contains("more than 4096 files"), "{err}");
+        files.pop();
+        assert_eq!(unpack(&archive(&files)).unwrap().len(), PACKAGE_FILES_MAX);
+    }
+
+    #[test]
     fn a_package_too_large_unpacked_is_refused() {
         let big = vec![b'a'; usize::try_from(PACKAGE_UNPACKED_MAX).unwrap() + 1];
         let err = unpack(&archive(&[("typst.toml", b""), ("big.txt", &big)])).unwrap_err();

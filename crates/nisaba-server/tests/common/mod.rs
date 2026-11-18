@@ -453,6 +453,48 @@ impl Peer {
         send(&mut self.ws, &Frame::Update(update)).await;
     }
 
+    /// Sends everything the server has not acknowledged while it reads, as
+    /// a browser does, and waits for the Ack. A client that only sent would
+    /// stop reading what the server sends it and be closed as too slow.
+    pub async fn push_reading(&mut self) {
+        self.doc.commit();
+        let update = self.doc.export(ExportMode::updates(&self.acked)).unwrap();
+        let local = self.doc.oplog_vv();
+        let (doc, parts) = (&self.doc, &mut self.parts);
+        let (mut sink, mut stream) = (&mut self.ws).split();
+        let sending = async move {
+            for message in split(&Frame::Update(update), PART) {
+                sink.send(Message::Binary(message.into())).await.unwrap();
+            }
+        };
+        let reading = async move {
+            loop {
+                let msg = tokio::time::timeout(Duration::from_secs(60), stream.next())
+                    .await
+                    .expect("frame within 60 s")
+                    .expect("socket open")
+                    .unwrap();
+                let Message::Binary(bytes) = msg else {
+                    continue;
+                };
+                match parts.push(&bytes, |_| Ok(())).unwrap() {
+                    Some(Frame::Update(u)) => {
+                        doc.import(&u).unwrap();
+                    }
+                    Some(Frame::Ack(vv)) => {
+                        let vv = VersionVector::decode(&vv).unwrap();
+                        if vv.includes_vv(&local) {
+                            return vv;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let ((), acked) = tokio::join!(sending, reading);
+        self.acked = acked;
+    }
+
     /// Waits until the server has acknowledged every local change.
     pub async fn saved(&mut self) {
         let local = self.doc.oplog_vv();

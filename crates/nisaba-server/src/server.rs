@@ -114,6 +114,14 @@ pub async fn serve(settings: Settings) -> Result<(), String> {
         result = serve => result.map_err(|e| format!("the server stopped: {e}"))?,
         () = grace => tracing::info!("stopped with connections still open"),
     }
+    // Each socket closes after the frame it is on, and waits for the
+    // client's answer to its close frame.
+    if tokio::time::timeout(SHUTDOWN_GRACE, app.sockets_closed())
+        .await
+        .is_err()
+    {
+        tracing::warn!("a sync socket was still open when the server stopped");
+    }
     // Every room finishes the write it is in; then the log is folded into
     // the database file.
     if tokio::time::timeout(SHUTDOWN_GRACE, app.rooms().quiesce())

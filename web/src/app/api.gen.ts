@@ -334,7 +334,7 @@ export type SetupRequest = {
   setup_code?: string | null
 }
 
-export type Standard = "pdf" | "pdf-a2b"
+export type Standard = "pdf" | "pdf-a-2b"
 
 /**
  * A person with an account, without the password hash.
@@ -937,7 +937,7 @@ export interface Routes {
     query: never
     body: never
     reply: { 200: Blob }
-    errors: "invalid_request" | "internal"
+    errors: "invalid_request" | "not_found" | "internal"
   }
   /**
    * A Typst package as `.tar.gz`; `archive` is `{version}.tar.gz`. Served from the server's cache, which downloads a missing package from the registry when the server allows that.
@@ -949,7 +949,7 @@ export interface Routes {
     query: never
     body: never
     reply: { 200: Blob }
-    errors: "invalid_request" | "not_signed_in" | "internal" | "package_unavailable"
+    errors: "invalid_request" | "not_signed_in" | "not_found" | "internal" | "package_unavailable"
   }
   /**
    * The sync socket (`x-nisaba-sync`). A handshake whose Origin is not the public address gets 403. Every other refusal is a close code after the upgrade.

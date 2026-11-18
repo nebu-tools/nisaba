@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use axum::extract::ws::{CloseFrame, Message};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::Response;
@@ -30,6 +29,8 @@ impl SocketSlot {
             return None;
         }
         *n += 1;
+        let total = sockets.values().sum();
+        app.inner.open_sockets.send_replace(total);
         Some(Self {
             app: app.clone(),
             user: user.to_owned(),
@@ -51,6 +52,8 @@ impl Drop for SocketSlot {
                 sockets.remove(&self.user);
             }
         }
+        let total = sockets.values().sum();
+        self.app.inner.open_sockets.send_replace(total);
     }
 }
 
@@ -108,13 +111,6 @@ pub async fn upgrade(
 /// Upgrades and at once closes with `code`.
 fn refuse(ws: WebSocketUpgrade, code: u16, reason: &'static str) -> Response {
     ws.on_upgrade(move |mut socket| async move {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            socket.send(Message::Close(Some(CloseFrame {
-                code,
-                reason: reason.into(),
-            }))),
-        )
-        .await;
+        crate::sync::close_with(&mut socket, code, reason).await;
     })
 }

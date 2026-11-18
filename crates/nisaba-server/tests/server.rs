@@ -449,6 +449,77 @@ async fn an_account_has_at_most_32_sockets() {
     panic!("the freed slot never came back");
 }
 
+/// A project takes at most 64 sockets, from any number of accounts.
+#[tokio::test]
+async fn a_project_has_at_most_64_sockets() {
+    let dir = tempfile::tempdir().unwrap();
+    accounts(
+        dir.path(),
+        &["a@example.org", "b@example.org", "c@example.org"],
+    );
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    let (owner, a) = log_in(base).await;
+    let project = new_project(&owner, base).await;
+    for email in ["b@example.org", "c@example.org"] {
+        let res = owner
+            .post(format!("{base}/api/projects/{project}/members"))
+            .json(&serde_json::json!({"email": email, "role": "viewer"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 201);
+    }
+    let (_, b) = log_in_as(base, "b@example.org").await;
+    let (_, c) = log_in_as(base, "c@example.org").await;
+    let mut open = Vec::new();
+    for (cookie, n) in [(&a, 32), (&b, 32)] {
+        for i in 0..n {
+            open.push(Peer::connect(base, cookie, &project, 300 + open.len() as u64 + i).await);
+        }
+    }
+    let mut ws = socket(base, &c, &project).await.unwrap();
+    assert_eq!(close_code(&mut ws).await, 4029);
+    drop(open.pop());
+    for _ in 0..50 {
+        let mut ws = socket(base, &c, &project).await.unwrap();
+        let hello = Frame::Hello {
+            protocol: PROTOCOL_VERSION,
+            version: Vec::new(),
+        };
+        ws.send(Message::Binary(hello.encode().into()))
+            .await
+            .unwrap();
+        if let Some(Ok(Message::Binary(_))) = ws.next().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the freed place never came back");
+}
+
+/// A Presence frame of 64 KiB goes to the others; one byte more closes the
+/// socket as malformed.
+#[tokio::test]
+async fn presence_is_at_most_64_kib() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path());
+    let base = &server.base;
+    let (client, cookie) = sign_up(base).await;
+    let project = new_project(&client, base).await;
+    let mut a = Peer::connect(base, &cookie, &project, 11).await;
+    let mut b = Peer::connect(base, &cookie, &project, 12).await;
+    send(&mut a.ws, &Frame::Presence(vec![1; 64 << 10])).await;
+    loop {
+        if let In::Frame(Frame::Presence(state)) = b.recv().await {
+            assert_eq!(state.len(), 64 << 10);
+            break;
+        }
+    }
+    send(&mut a.ws, &Frame::Presence(vec![1; (64 << 10) + 1])).await;
+    assert_eq!(closed_with(&mut a.ws).await, 4000);
+}
+
 #[tokio::test]
 async fn a_large_upload_is_refused() {
     let dir = tempfile::tempdir().unwrap();

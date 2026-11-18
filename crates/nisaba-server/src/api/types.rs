@@ -302,6 +302,7 @@ pub enum Standard {
     #[default]
     Pdf,
     /// PDF/A-2b, for archiving.
+    #[serde(rename = "pdf-a-2b")]
     PdfA2b,
 }
 

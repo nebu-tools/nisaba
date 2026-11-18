@@ -2,6 +2,11 @@
 //! renaming and deleting projects, members and roles, and what each change
 //! does to an open sync socket.
 
+#![allow(
+    clippy::too_many_lines,
+    reason = "an end-to-end story reads best as one test"
+)]
+
 mod common;
 
 use std::time::{Duration, Instant};

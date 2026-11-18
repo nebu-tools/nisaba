@@ -2,6 +2,11 @@
 //! sign-out everywhere, password changes, rehashing, and the
 //! administrator's account routes.
 
+#![allow(
+    clippy::too_many_lines,
+    reason = "an end-to-end story reads best as one test"
+)]
+
 mod common;
 
 use std::time::Duration;
@@ -327,8 +332,12 @@ async fn administrators_manage_accounts() {
     let res = make("warden@example.org", PASSWORD).await;
     assert_eq!(res.status(), 409);
     assert_eq!(json(res).await["code"], "email_taken");
+    let long = format!("{}@example.org", "w".repeat(254 - 12 + 1));
+    let longest = format!("{}@example.org", "w".repeat(254 - 12));
+    assert_eq!(make(&longest, PASSWORD).await.status(), 201);
     for (email, password, field) in [
         ("no at sign", PASSWORD, "email"),
+        (long.as_str(), PASSWORD, "email"),
         ("w2@example.org", "short", "password"),
     ] {
         let res = make(email, password).await;
@@ -342,7 +351,10 @@ async fn administrators_manage_accounts() {
         .iter()
         .map(|u| u["email"].clone())
         .collect();
-    assert_eq!(emails, ["a@example.org", "warden@example.org"]);
+    assert_eq!(
+        emails,
+        ["a@example.org", "warden@example.org", longest.as_str()]
+    );
 
     let (warden_client, warden_cookie) = log_in_as(base, "warden@example.org").await;
     for res in [

@@ -201,14 +201,28 @@ impl<S> Socket for S where
 {
 }
 
-/// Sends the close frame if the client takes it within [`CLOSE_WAIT`]. The
-/// caller drops the socket afterwards either way.
-async fn close_with(socket: &mut impl Socket, code: u16, reason: &str) {
+/// Sends the close frame and reads, discarding, until the client answers
+/// it, all within [`CLOSE_WAIT`]. The caller drops the socket afterwards
+/// either way. Reading matters: a socket dropped with frames the client
+/// sent still unread ends with a TCP reset, and the client may then never
+/// see the close frame and its code.
+pub(crate) async fn close_with(socket: &mut impl Socket, code: u16, reason: &str) {
     let frame = Message::Close(Some(CloseFrame {
         code,
         reason: reason.to_owned().into(),
     }));
-    let _ = tokio::time::timeout(CLOSE_WAIT, socket.send(frame)).await;
+    let deadline = Instant::now() + CLOSE_WAIT;
+    if !matches!(
+        tokio::time::timeout_at(deadline, socket.send(frame)).await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
+    while let Ok(Some(Ok(message))) = tokio::time::timeout_at(deadline, socket.next()).await {
+        if matches!(message, Message::Close(_)) {
+            break;
+        }
+    }
 }
 
 async fn refuse(socket: &mut impl Socket, e: &SyncError) {
@@ -363,9 +377,9 @@ pub async fn run(mut socket: impl Socket, rooms: Rooms, project: String, grant: 
         }
     };
     room.leave(peer);
-    // Whatever was on its way in is given back before the close, which may
-    // wait on the client.
-    drop((transfer, parts));
+    // Whatever was on its way in, and the grant, are given back before the
+    // close, which may wait on the client.
+    drop((transfer, parts, ending, grant));
     match end {
         End::Gone => {}
         End::Refused(e) => {

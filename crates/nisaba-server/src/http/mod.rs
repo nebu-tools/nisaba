@@ -73,6 +73,8 @@ struct Inner {
     packages: Packages,
     fonts: Fonts,
     sockets: Mutex<HashMap<String, usize>>,
+    /// How many sync sockets are open, for a stop that waits for them.
+    open_sockets: tokio::sync::watch::Sender<usize>,
     stopping: tokio::sync::watch::Sender<bool>,
 }
 
@@ -96,6 +98,7 @@ impl App {
                 packages,
                 fonts,
                 sockets: Mutex::default(),
+                open_sockets: tokio::sync::watch::channel(0).0,
                 stopping,
             }),
         })
@@ -133,6 +136,12 @@ impl App {
         self.inner.stopping.send_replace(true);
         self.inner.exporter.stop();
         self.inner.rooms.stop();
+    }
+
+    /// Resolves when no sync socket is open.
+    pub async fn sockets_closed(&self) {
+        let mut open = self.inner.open_sockets.subscribe();
+        let _ = open.wait_for(|n| *n == 0).await.map(drop);
     }
 
     fn is_stopping(&self) -> bool {
