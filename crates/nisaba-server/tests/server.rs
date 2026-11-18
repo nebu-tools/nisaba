@@ -1268,10 +1268,11 @@ async fn a_begin_may_declare_exactly_the_space_left() {
     let mut exact = Peer::connect(base, &cookie, &project, 12).await;
     send(&mut exact.ws, &Frame::Begin { total: total - 1 }).await;
     assert!(within(10, || room.space() == 0).await, "{}", room.space());
-    // Nothing else fits beside it, not even a small edit in one frame.
+    // Nothing else fits beside it, not even a small edit in one frame. The
+    // project is not full, so the edit is told to try again.
     let mut small = Peer::connect(base, &cookie, &project, 13).await;
     small.type_text(" Limpets").await;
-    assert_eq!(closed_with(&mut small.ws).await, 4130);
+    assert_eq!(closed_with(&mut small.ws).await, 1013);
     drop(exact);
     assert!(within(10, || room.space() == left).await);
 }

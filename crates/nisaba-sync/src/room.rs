@@ -19,7 +19,8 @@
 //!
 //! The quota counts what is stored and what unfinished multi-part updates
 //! have reserved ([`Room::reserve`]). An update fits only in what neither
-//! holds.
+//! holds. When it would fit but for a reservation, the refusal is "try again
+//! later" and not "the project is full", because the reservation ends.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -302,10 +303,7 @@ impl<S: RoomStore> Room<S> {
     /// refuses it when they are not there.
     pub fn reserve(&self, len: usize) -> SyncResult<Reservation> {
         let mut quota = lock(&self.quota);
-        let left = self.left(&quota, 0);
-        if len > left {
-            return Err(SyncError::ProjectFull { need: len, left });
-        }
+        self.fits(&quota, len, 0)?;
         quota.reserved += len;
         Ok(Reservation {
             quota: Arc::clone(&self.quota),
@@ -318,6 +316,21 @@ impl<S: RoomStore> Room<S> {
         self.limits
             .max_document
             .saturating_sub(quota.stored + quota.reserved - mine)
+    }
+
+    /// Whether `need` bytes fit when `mine` of the reserved bytes are the
+    /// caller's own. The project is full when they do not fit beside what
+    /// is stored. When only other unfinished updates are in the way, the
+    /// space may come back, so the answer is to try again.
+    fn fits(&self, quota: &Quota, need: usize, mine: usize) -> SyncResult<()> {
+        let left = self.left(quota, mine);
+        if need <= left {
+            Ok(())
+        } else if need <= self.limits.max_document.saturating_sub(quota.stored) {
+            Err(SyncError::Busy)
+        } else {
+            Err(SyncError::ProjectFull { need, left })
+        }
     }
 
     #[must_use]
@@ -350,13 +363,7 @@ impl<S: RoomStore> Room<S> {
         });
         {
             let mut quota = lock(&self.quota);
-            let left = self.left(&quota, held.len);
-            if update.len() > left {
-                return Err(SyncError::ProjectFull {
-                    need: update.len(),
-                    left,
-                });
-            }
+            self.fits(&quota, update.len(), held.len)?;
             quota.reserved = quota.reserved - held.len + update.len();
             held.len = update.len();
         }
@@ -764,15 +771,20 @@ mod tests {
         let (a, mut rx) = room.join(Role::Editor, hello(&[]), open()).unwrap();
         welcome(&mut rx);
         let first = room.reserve(600 << 10).unwrap();
-        // Two Begins that each fit alone do not both fit.
+        // Two Begins that each fit alone do not both fit. The project is not
+        // full, so the second is told to try again.
         let err = room.reserve(600 << 10).err().unwrap();
-        assert!(matches!(err, SyncError::ProjectFull { .. }), "{err:?}");
+        assert!(matches!(err, SyncError::Busy), "{err:?}");
+        assert_eq!(err.close_code(), crate::close::TRY_AGAIN);
         // Nor does a single-frame update that would take the held space.
         let big = edit(&LoroDoc::new(), &noise(500 << 10));
         let err = room
             .receive(a, Frame::Update(big.clone()), None)
             .await
             .unwrap_err();
+        assert!(matches!(err, SyncError::Busy), "{err:?}");
+        // One that would not fit in the empty project either is refused for good.
+        let err = room.reserve((1 << 20) + 1).err().unwrap();
         assert!(matches!(err, SyncError::ProjectFull { .. }), "{err:?}");
         assert!(store.load("p").unwrap().log.is_empty());
         // A dropped transfer gives its space back.

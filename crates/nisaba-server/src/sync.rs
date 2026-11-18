@@ -5,7 +5,8 @@
 //!
 //! A multi-part update holds memory and quota until its last part arrives.
 //! Three limits keep that bounded: its declared length is reserved against
-//! the project's quota at the Begin (4130 when it does not fit), all
+//! the project's quota at the Begin (4130 when the project is too full for it,
+//! 1013 when only another unfinished transfer is in the way), all
 //! unfinished updates together may hold at most the server's transfer budget
 //! (1013, try again later), and each must arrive by a deadline counted from
 //! its Begin (4008, send it again). Sends have a deadline too, so a client
@@ -514,7 +515,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_begin_that_does_not_fit_beside_another_is_refused() {
+    async fn a_begin_that_does_not_fit_beside_another_is_told_to_try_again() {
         let s = setup(BUDGET);
         let room = s.rooms.get("p").await.unwrap();
         let a = s.connect("p", 8).await;
@@ -526,7 +527,7 @@ mod tests {
         a.send(&half);
         settle().await;
         b.send(&half);
-        assert_eq!(b.closed().await, Some(close::TOO_LARGE));
+        assert_eq!(b.closed().await, Some(close::TRY_AGAIN));
         assert!(!a.session.is_finished());
     }
 

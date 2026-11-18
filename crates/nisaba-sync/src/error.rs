@@ -39,6 +39,8 @@ pub enum SyncError {
     TooSlow,
     #[error("the update did not arrive in time; it will be sent again")]
     TimedOut,
+    /// Unfinished large updates hold the space this one needs, in the
+    /// server's budget or in the project's quota. It ends when they do.
     #[error("the server is busy with other large updates; try again later")]
     Busy,
     /// Access to the project ended before the update was written.

@@ -134,9 +134,14 @@ fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
 }
 
 /// A room refused an update the server built: 413 when the project is at its
-/// size limit, 500 otherwise.
+/// size limit, 503 when an unfinished large update holds the space, 500
+/// otherwise.
 fn refused_update(e: nisaba_sync::SyncError) -> (StatusCode, String) {
     match e {
+        nisaba_sync::SyncError::Busy => fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a large update to this project is on its way; try again in a minute",
+        ),
         nisaba_sync::SyncError::TooLarge(_) | nisaba_sync::SyncError::ProjectFull { .. } => fail(
             StatusCode::PAYLOAD_TOO_LARGE,
             "the project is at its size limit for text and history",
@@ -621,6 +626,8 @@ mod tests {
     fn a_full_project_refuses_an_upload_with_413() {
         let full = nisaba_sync::SyncError::ProjectFull { need: 10, left: 1 };
         assert_eq!(refused_update(full).0, StatusCode::PAYLOAD_TOO_LARGE);
+        let busy = nisaba_sync::SyncError::Busy;
+        assert_eq!(refused_update(busy).0, StatusCode::SERVICE_UNAVAILABLE);
         let big = nisaba_sync::SyncError::TooLarge(10);
         assert_eq!(refused_update(big).0, StatusCode::PAYLOAD_TOO_LARGE);
     }
