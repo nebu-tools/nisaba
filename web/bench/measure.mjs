@@ -2,7 +2,7 @@
 // measurements as JSON. Every run uses a free port and a fresh data directory,
 // and stops the server and the browser when it ends.
 //
-//   node web/spike/measure.mjs target/release/nisaba
+//   node web/bench/measure.mjs target/release/nisaba
 import { spawn } from "node:child_process"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"

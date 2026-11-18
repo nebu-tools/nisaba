@@ -1,39 +1,34 @@
 {
-  "name": "@nisaba/web",
+  "name": "nisaba-web",
   "version": "0.1.0",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint --deny-warnings src bench vite.config.ts",
     "test": "vitest run",
-    "lint": "oxlint .",
-    "e2e": "playwright test --config e2e/",
+    "build": "vite build",
+    "bench": "node bench/measure.mjs ../target/release/nisaba",
     "postinstall": "patch-package"
   },
   "dependencies": {
-    "@codemirror/autocomplete": "^6.18.6",
-    "@codemirror/search": "6.7.1",
-    "@codemirror/state": "^6.5.2",
-    "@codemirror/view": "^6.36.5",
-    "@fontsource/dm-mono": "^5.3.0",
-    "@fontsource/dm-sans": "^5.3.0",
-    "@fontsource/source-serif-4": "^5.3.0",
-    "codemirror": "^6.0.1",
-    "effect": "4.0.0-beta.105",
+    "@codemirror/state": "6.7.1",
+    "@codemirror/view": "6.43.8",
+    "codemirror": "6.0.2",
     "loro-codemirror": "0.3.3",
-    "loro-crdt": "^1.13.9",
-    "pdfjs-dist": "^6.2.108"
+    "loro-crdt": "1.13.9",
+    "solid-js": "1.9.19"
   },
   "devDependencies": {
-    "@playwright/test": "^1.52.0",
-    "@types/node": "^22.15.3",
-    "jsdom": "^30.0.1",
-    "oxlint": "^1.77.0",
-    "patch-package": "^8.0.1",
-    "typescript": "^7.0.2",
-    "vite": "^8.2.1",
-    "vitest": "^4.1.10"
+    "@playwright/test": "1.62.1",
+    "@types/node": "22.20.1",
+    "oxlint": "1.77.0",
+    "patch-package": "8.0.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.1",
+    "vite-plugin-solid": "2.11.16",
+    "vitest": "4.1.10"
   }
 }

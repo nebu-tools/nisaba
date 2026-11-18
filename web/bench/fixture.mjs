@@ -2,7 +2,7 @@
 // project-create API accepts: chapters in separate files, SVG and PNG
 // figures, and a 60-entry BibTeX bibliography cited throughout.
 //
-//   node web/spike/fixture.mjs out.json
+//   node web/bench/fixture.mjs out.json
 import { writeFileSync } from "node:fs"
 import { deflateSync } from "node:zlib"
 
