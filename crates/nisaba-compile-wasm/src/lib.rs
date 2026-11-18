@@ -274,3 +274,68 @@ pub fn new_compile_workers(max_workers: usize, idle_ttl_millis: f64) -> JsCompil
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
+
+/// The preview compiler: one per open project, fed one file at a time.
+///
+/// The worker writes every file once, then only the file that changed, and
+/// calls [`JsLiveCompiler::compile`]. The result lists a fingerprint per page;
+/// the worker renders only the pages whose fingerprint changed.
+#[wasm_bindgen]
+pub struct JsLiveCompiler {
+    inner: nisaba_compile_core::live::LiveCompiler,
+}
+
+#[wasm_bindgen]
+impl JsLiveCompiler {
+    /// Creates a compiler rooted at `entry`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(entry: &str) -> Result<JsLiveCompiler, JsError> {
+        nisaba_compile_core::live::LiveCompiler::new(entry)
+            .map(|inner| Self { inner })
+            .map_err(|error| JsError::new(&error))
+    }
+
+    /// Writes a text file.
+    pub fn write_text(&mut self, path: &str, text: String) {
+        self.inner
+            .write(path, nisaba_compile_core::live::FileContents::Text(text));
+    }
+
+    /// Writes a binary file.
+    pub fn write_bytes(&mut self, path: &str, bytes: Vec<u8>) {
+        self.inner
+            .write(path, nisaba_compile_core::live::FileContents::Bytes(bytes));
+    }
+
+    /// Removes a file.
+    pub fn remove(&mut self, path: &str) {
+        self.inner.remove(path);
+    }
+
+    /// Compiles and returns the [`Compiled`](nisaba_compile_core::live::Compiled) result as JSON.
+    pub fn compile(&mut self) -> Result<String, JsError> {
+        serde_json::to_string(&self.inner.compile())
+            .map_err(|error| JsError::new(&error.to_string()))
+    }
+
+    /// Renders one page of the last good layout as SVG.
+    pub fn page_svg(&self, index: usize) -> Option<String> {
+        self.inner.page_svg(index)
+    }
+
+    /// Renders one page as RGBA pixels at `pixel_per_pt`. The first eight
+    /// bytes are the width and height as little-endian `u32`; pixels follow.
+    pub fn page_rgba(&self, index: usize, pixel_per_pt: f32) -> Option<Vec<u8>> {
+        let (width, height, pixels) = self.inner.page_rgba(index, pixel_per_pt)?;
+        let mut out = Vec::with_capacity(8 + pixels.len());
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&pixels);
+        Some(out)
+    }
+
+    /// Exports the last good layout as PDF.
+    pub fn pdf(&self) -> Result<Vec<u8>, JsError> {
+        self.inner.pdf().map_err(|error| JsError::new(&error))
+    }
+}

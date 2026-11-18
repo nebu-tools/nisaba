@@ -46,6 +46,8 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 
+pub mod live;
+
 use std::{
     collections::HashMap,
     path::Path,

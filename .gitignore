@@ -37,3 +37,4 @@ Thumbs.db
 # Playwright e2e artifacts
 test-results/
 web/playwright-report/
+web/dist-server/
