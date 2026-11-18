@@ -46,6 +46,11 @@ pub enum SyncError {
     /// Access to the project ended before the update was written.
     #[error("access to the project ended")]
     Ended,
+    /// The room was closed: the project was deleted or the server stops.
+    #[error("the project is closed")]
+    Closed,
+    #[error("a presence frame of {0} bytes is larger than allowed")]
+    PresenceTooLarge(usize),
     #[error("not a Loro update: {0}")]
     Loro(String),
     #[error("storage: {0}")]
@@ -60,7 +65,9 @@ impl SyncError {
             Self::Frame(FrameError::TooLarge(_)) | Self::TooLarge(_) | Self::ProjectFull { .. } => {
                 close::TOO_LARGE
             }
-            Self::Frame(_) | Self::Unexpected | Self::Loro(_) => close::MALFORMED,
+            Self::Frame(_) | Self::Unexpected | Self::Loro(_) | Self::PresenceTooLarge(_) => {
+                close::MALFORMED
+            }
             Self::Version { .. } => close::VERSION,
             Self::Forbidden => close::FORBIDDEN,
             Self::Full => close::FULL,
@@ -68,6 +75,7 @@ impl SyncError {
             Self::TimedOut => close::TIMED_OUT,
             Self::Busy => close::TRY_AGAIN,
             Self::Ended => close::SIGNED_OUT,
+            Self::Closed => close::RESTARTING,
             Self::Storage(_) => close::SERVER_ERROR,
         }
     }

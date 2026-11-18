@@ -10,10 +10,9 @@
  * `nisaba_sync::protocol`, in both directions.
  */
 
-export const PROTOCOL = 2
+import { PART } from "../app/api.gen"
 
-/** The longest message: 1 MiB. */
-export const PART = 1 << 20
+export { PART, PROTOCOL } from "../app/api.gen"
 
 export type Frame =
   | { type: "hello"; protocol: number; version: Uint8Array }
@@ -34,23 +33,8 @@ const HEARTBEAT = 6
 const BEGIN = 7
 const PART_TYPE = 8
 
-/** WebSocket close codes the server sends. */
-export const Close = {
-  normal: 1000,
-  /** The server holds as many unfinished large updates as it may. */
-  tryAgain: 1013,
-  malformed: 4000,
-  tooSlow: 4002,
-  /** A large update did not arrive by its deadline; nothing of it was kept. */
-  timedOut: 4008,
-  forbidden: 4003,
-  notFound: 4004,
-  full: 4029,
-  tooLarge: 4130,
-  version: 4400,
-  signedOut: 4401,
-  serverError: 4500,
-} as const
+/** WebSocket close codes, generated from the server (api.gen.ts). */
+export { Close } from "../app/api.gen"
 
 export class FrameError extends Error {}
 

@@ -12,12 +12,17 @@
 //! [`Compiled::missing_fonts`] each font a compile asked for that the host has
 //! not yet given it with [`LiveCompiler::add_font`]. The host loads those
 //! fonts and compiles again.
+//!
+//! Packages work the same way. A compile that imports a package the host
+//! has not given with [`LiveCompiler::add_package`] fails with a problem
+//! that names it, and lists it in [`Compiled::missing_packages`].
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use typst::diag::{FileError, FileResult, PackageError, Severity, SourceDiagnostic};
 use typst::foundations::{Bytes, Datetime};
+use typst::syntax::package::PackageSpec;
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -90,6 +95,18 @@ pub struct Compiled {
     /// Catalogue indices of fonts this compile wanted and did not have. When
     /// this is not empty, the host adds those fonts and compiles again.
     pub missing_fonts: Vec<usize>,
+    /// Packages this compile imported and did not have, as `@namespace/name:version`.
+    pub missing_packages: Vec<String>,
+}
+
+/// The kind of PDF [`LiveCompiler::pdf`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PdfKind {
+    /// Typst's normal output.
+    #[default]
+    Plain,
+    /// PDF/A-2b, for archiving.
+    A2b,
 }
 
 /// A long-lived compiler for one project.
@@ -113,7 +130,10 @@ impl LiveCompiler {
                 files: HashMap::new(),
                 fonts: fonts.iter().map(|_| None).collect(),
                 faces: fonts.iter().map(|f| f.index).collect(),
+                infos: fonts.iter().map(|f| f.info.clone()).collect(),
                 missing: Mutex::new(BTreeSet::new()),
+                packages: HashMap::new(),
+                missing_packages: Mutex::new(BTreeSet::new()),
                 today: None,
             },
             entry: entry.to_owned(),
@@ -159,6 +179,50 @@ impl LiveCompiler {
         Ok(())
     }
 
+    /// Adds every face of a font file that is not in the catalogue, such as
+    /// a font file of the project or one the server administrator added,
+    /// and loads it. Returns how many faces it added; 0 when the bytes are
+    /// not a font Typst reads (TrueType or OpenType, or a collection).
+    pub fn add_font_file(&mut self, data: Vec<u8>) -> usize {
+        let bytes = Bytes::new(data);
+        let mut added = 0;
+        for font in Font::iter(bytes) {
+            self.world.infos.push(font.info().clone());
+            self.world.faces.push(font.index());
+            self.world.fonts.push(Some(font));
+            added += 1;
+        }
+        if added > 0 {
+            self.world.book = LazyHash::new(FontBook::from_infos(self.world.infos.iter().cloned()));
+        }
+        added
+    }
+
+    /// Gives the compiler the files of a package, as paths inside the
+    /// package and their bytes. `spec` is `@namespace/name:version`.
+    pub fn add_package(&mut self, spec: &str, files: Vec<(String, Vec<u8>)>) -> Result<(), String> {
+        let spec: PackageSpec = spec.parse().map_err(|e| format!("{spec}: {e}"))?;
+        let mut entries = HashMap::new();
+        for (path, data) in files {
+            let vpath = VirtualPath::new(&path).map_err(|e| format!("{path}: {e}"))?;
+            let id = RootedPath::new(VirtualRoot::Package(spec.clone()), vpath).intern();
+            let entry = match String::from_utf8(data) {
+                Ok(text)
+                    if std::path::Path::new(&path)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("typ")) =>
+                {
+                    Entry::Text(Source::new(id, text.clone()), Bytes::from_string(text))
+                }
+                Ok(text) => Entry::Bytes(Bytes::from_string(text)),
+                Err(e) => Entry::Bytes(Bytes::new(e.into_bytes())),
+            };
+            entries.insert(id, entry);
+        }
+        self.world.packages.insert(spec, entries);
+        Ok(())
+    }
+
     /// Sets the date `datetime.today()` returns. Without it, that call fails.
     pub fn set_today(&mut self, year: i32, month: u8, day: u8) {
         self.world.today = Datetime::from_ymd(year, month, day);
@@ -168,6 +232,11 @@ impl LiveCompiler {
     /// preview can go on showing the last good pages next to the problems.
     pub fn compile(&mut self) -> Compiled {
         self.world.missing.lock().expect("missing fonts").clear();
+        self.world
+            .missing_packages
+            .lock()
+            .expect("missing packages")
+            .clear();
         let result = typst::compile::<PagedDocument>(&self.world);
         typst::comemo::evict(10);
         let world = &self.world;
@@ -201,12 +270,17 @@ impl LiveCompiler {
         let missing_fonts = std::mem::take(&mut *world.missing.lock().expect("missing fonts"))
             .into_iter()
             .collect();
+        let missing_packages =
+            std::mem::take(&mut *world.missing_packages.lock().expect("missing packages"))
+                .into_iter()
+                .collect();
         Compiled {
             pages,
             sizes,
             problems,
             ok,
             missing_fonts,
+            missing_packages,
         }
     }
 
@@ -224,16 +298,29 @@ impl LiveCompiler {
         Some((pixmap.width(), pixmap.height(), pixmap.take()))
     }
 
-    /// Exports the last good layout as PDF.
-    pub fn pdf(&self) -> Result<Vec<u8>, String> {
+    /// Exports the last good layout as PDF of the given kind. A PDF/A file
+    /// is dated with the date set by [`LiveCompiler::set_today`], at
+    /// midnight UTC, so the same files on the same day give the same bytes.
+    pub fn pdf(&self, kind: PdfKind) -> Result<Vec<u8>, String> {
         let document = self.document.as_ref().ok_or("nothing compiled yet")?;
-        typst_pdf::pdf(document, &typst_pdf::PdfOptions::default()).map_err(|errors| {
+        let join = |errors: &[_]| {
             errors
                 .iter()
-                .map(|error| error.message.to_string())
+                .map(|error: &SourceDiagnostic| error.message.to_string())
                 .collect::<Vec<_>>()
                 .join("; ")
-        })
+        };
+        let mut options = typst_pdf::PdfOptions::default();
+        if kind == PdfKind::A2b {
+            options.standards = typst_pdf::PdfStandards::new(&[typst_pdf::PdfStandard::A_2b])
+                .map_err(|e| e.message().to_string())?;
+            options.timestamp = self
+                .world
+                .today
+                .and_then(|d| Datetime::from_ymd_hms(d.year()?, d.month()?, d.day()?, 0, 0, 0))
+                .map(typst_pdf::Timestamp::new_utc);
+        }
+        typst_pdf::pdf(document, &options).map_err(|errors| join(&errors))
     }
 
     /// The entry file this compiler is rooted at.
@@ -262,19 +349,34 @@ struct ProjectWorld {
     files: HashMap<FileId, Entry>,
     fonts: Vec<Option<Font>>,
     faces: Vec<u32>,
+    infos: Vec<FontInfo>,
     missing: Mutex<BTreeSet<usize>>,
+    packages: HashMap<PackageSpec, HashMap<FileId, Entry>>,
+    missing_packages: Mutex<BTreeSet<String>>,
     today: Option<Datetime>,
 }
 
 impl ProjectWorld {
     fn entry(&self, id: FileId) -> FileResult<&Entry> {
         let rooted = id.get();
+        let not_found = || FileError::NotFound(rooted.vpath().get_without_slash().into());
         if let VirtualRoot::Package(spec) = rooted.root() {
-            return Err(FileError::Package(PackageError::NotFound(spec.clone())));
+            let Some(files) = self.packages.get(spec) else {
+                self.missing_packages
+                    .lock()
+                    .expect("missing packages")
+                    .insert(spec.to_string());
+                return Err(FileError::Package(PackageError::Other(Some(
+                    format!(
+                        "package {spec} is not available: the server could not find or \
+                         download it, or this device has no copy of it while offline"
+                    )
+                    .into(),
+                ))));
+            };
+            return files.get(&id).ok_or_else(not_found);
         }
-        self.files
-            .get(&id)
-            .ok_or_else(|| FileError::NotFound(rooted.vpath().get_without_slash().into()))
+        self.files.get(&id).ok_or_else(not_found)
     }
 
     fn problem(&self, diag: &SourceDiagnostic) -> Problem {
@@ -283,8 +385,8 @@ impl ProjectWorld {
             Severity::Warning => "warning",
         };
         let id = diag.span.id();
-        let text = id.and_then(|id| match self.files.get(&id) {
-            Some(Entry::Text(source, _)) => Some(source.text()),
+        let text = id.and_then(|id| match self.entry(id) {
+            Ok(Entry::Text(source, _)) => Some(source.text()),
             _ => None,
         });
         let range = self.range(diag.span);
@@ -293,7 +395,14 @@ impl ProjectWorld {
         Problem {
             severity,
             message: diag.message.to_string(),
-            path: id.map(|id| id.get().vpath().get_without_slash().to_owned()),
+            path: id.map(|id| {
+                let rooted = id.get();
+                let path = rooted.vpath().get_without_slash();
+                match rooted.root() {
+                    VirtualRoot::Project => path.to_owned(),
+                    VirtualRoot::Package(spec) => format!("{spec}/{path}"),
+                }
+            }),
             start: range.as_ref().and_then(|r| to_utf16(r.start)),
             end: range.as_ref().and_then(|r| to_utf16(r.end)),
         }
@@ -457,7 +566,12 @@ mod tests {
         );
         let result = host.compile();
         assert!(result.ok, "{:?}", result.problems);
-        assert!(host.compiler.pdf().unwrap().starts_with(b"%PDF"));
+        assert!(
+            host.compiler
+                .pdf(PdfKind::Plain)
+                .unwrap()
+                .starts_with(b"%PDF")
+        );
     }
 
     #[test]
@@ -477,5 +591,87 @@ mod tests {
         assert!(host.compile().ok);
         host.compiler.remove("part.typ");
         assert!(!host.compile().ok);
+    }
+}
+
+#[cfg(test)]
+mod packages_fonts_and_archival_pdf {
+    use super::*;
+
+    /// A compiler with every bundled font loaded.
+    fn compiler() -> LiveCompiler {
+        let mut fonts = Vec::new();
+        let mut data = Vec::new();
+        for (i, bytes) in typst_assets::fonts().enumerate() {
+            for entry in FontEntry::read(&format!("{i}.ttf"), bytes) {
+                fonts.push(entry);
+                data.push(bytes.to_vec());
+            }
+        }
+        let mut c = LiveCompiler::new("main.typ", &fonts).unwrap();
+        for (i, bytes) in data.into_iter().enumerate() {
+            c.add_font(i, bytes).unwrap();
+        }
+        c.set_today(2026, 11, 18);
+        c
+    }
+
+    #[test]
+    fn a_missing_package_is_named_and_a_given_one_is_used() {
+        let mut c = compiler();
+        c.write(
+            "main.typ",
+            FileContents::Text("#import \"@preview/shells:0.1.0\": whelk\n#whelk".into()),
+        );
+        let first = c.compile();
+        assert!(!first.ok);
+        assert_eq!(first.missing_packages, ["@preview/shells:0.1.0"]);
+        assert!(
+            first.problems[0].message.contains("@preview/shells:0.1.0"),
+            "{:?}",
+            first.problems
+        );
+        c.add_package(
+            "@preview/shells:0.1.0",
+            vec![
+                (
+                    "typst.toml".into(),
+                    b"[package]\nname = \"shells\"\nversion = \"0.1.0\"\nentrypoint = \"lib.typ\"\n"
+                        .to_vec(),
+                ),
+                ("lib.typ".into(), b"#let whelk = [Whelk]".to_vec()),
+            ],
+        )
+        .unwrap();
+        let second = c.compile();
+        assert!(second.ok, "{:?}", second.problems);
+        assert!(second.missing_packages.is_empty());
+        assert!(c.add_package("not a spec", vec![]).is_err());
+    }
+
+    #[test]
+    fn a_font_file_adds_its_faces() {
+        let mut c = LiveCompiler::new("main.typ", &[]).unwrap();
+        assert_eq!(c.add_font_file(b"not a font".to_vec()), 0);
+        let font = typst_assets::fonts().next().unwrap().to_vec();
+        assert!(c.add_font_file(font) >= 1);
+        c.write("main.typ", FileContents::Text("Periwinkle".into()));
+        let result = c.compile();
+        assert!(result.ok, "{:?}", result.problems);
+        assert!(result.missing_fonts.is_empty());
+    }
+
+    #[test]
+    fn a_pdf_a_is_dated_by_today_and_repeatable() {
+        let mut c = compiler();
+        c.write("main.typ", FileContents::Text("= Rock pools".into()));
+        assert!(c.compile().ok);
+        let a = c.pdf(PdfKind::A2b).unwrap();
+        assert_eq!(a, c.pdf(PdfKind::A2b).unwrap());
+        let text = String::from_utf8_lossy(&a);
+        assert!(text.contains("pdfaid:part"), "no PDF/A identification");
+        assert!(text.contains("2026-11-18"), "not dated by today");
+        let plain = c.pdf(PdfKind::Plain).unwrap();
+        assert!(!String::from_utf8_lossy(&plain).contains("pdfaid:part"));
     }
 }

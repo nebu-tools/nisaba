@@ -1,9 +1,23 @@
 /** The HTTP API. The types come from the server; see api.gen.ts. */
-import type { Created, Credentials, NewProject, ProjectRow, Session, SetupRequest, User } from "./api.gen"
+import type { ApiError, Credentials, ErrorCode, NewProject, Project, Session, SetupRequest, User } from "./api.gen"
+
+/** A refusal from the server: its stable code and a sentence to show. */
+export class ApiFailure extends Error {
+  constructor(
+    readonly code: ErrorCode,
+    message: string,
+    readonly field?: string | null,
+  ) {
+    super(message)
+  }
+}
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init })
-  if (!res.ok) throw new Error((await res.text()) || res.statusText)
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as ApiError | null
+    throw body ? new ApiFailure(body.code, body.message, body.field) : new ApiFailure("internal", res.statusText)
+  }
   return (res.headers.get("content-type") ?? "").includes("json") ? (res.json() as Promise<T>) : (undefined as T)
 }
 
@@ -13,8 +27,8 @@ export const api = {
   session: () => call<Session>("/api/session"),
   setup: (body: SetupRequest) => post<User>("/api/setup", body),
   login: (body: Credentials) => post<User>("/api/login", body),
-  projects: () => call<ProjectRow[]>("/api/projects"),
-  createProject: (body: NewProject) => post<Created>("/api/projects", body),
+  projects: () => call<Project[]>("/api/projects"),
+  createProject: (body: NewProject) => post<Project>("/api/projects", body),
 }
 
 /** Today's local calendar date as YYYY-MM-DD; exports use it (DESIGN.md section 8). */

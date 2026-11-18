@@ -6,7 +6,7 @@
 //! and the fonts the compile asked for and did not have, so the worker can
 //! fetch them and compile again.
 
-use nisaba_compile_core::{FileContents, FontEntry, LiveCompiler};
+use nisaba_compile_core::{FileContents, FontEntry, LiveCompiler, PdfKind};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -66,7 +66,13 @@ impl JsLiveCompiler {
         Some(out)
     }
 
-    pub fn pdf(&self) -> Result<Vec<u8>, JsError> {
-        self.inner.pdf().map_err(|e| JsError::new(&e))
+    /// The PDF of the last good layout; `archival` asks for PDF/A-2b.
+    pub fn pdf(&self, archival: bool) -> Result<Vec<u8>, JsError> {
+        let kind = if archival {
+            PdfKind::A2b
+        } else {
+            PdfKind::Plain
+        };
+        self.inner.pdf(kind).map_err(|e| JsError::new(&e))
     }
 }

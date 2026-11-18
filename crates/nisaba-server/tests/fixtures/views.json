@@ -1,0 +1,40 @@
+{
+  "about": "The three views of text with tracked changes (DESIGN.md section 5). Each case is text in segments; a segment may carry the mark ins (a suggested insertion) or del (a suggested deletion). The server's text_in_view and the client's copy must give these texts.",
+  "cases": [
+    {
+      "name": "no marks",
+      "segments": [{ "text": "Limpets cling to rock." }],
+      "written": "Limpets cling to rock.",
+      "applied": "Limpets cling to rock.",
+      "original": "Limpets cling to rock."
+    },
+    {
+      "name": "an insertion",
+      "segments": [{ "text": "Limpets cling " }, { "text": "tightly ", "mark": "ins" }, { "text": "to rock." }],
+      "written": "Limpets cling tightly to rock.",
+      "applied": "Limpets cling tightly to rock.",
+      "original": "Limpets cling to rock."
+    },
+    {
+      "name": "a deletion",
+      "segments": [{ "text": "Limpets " }, { "text": "always ", "mark": "del" }, { "text": "cling to rock." }],
+      "written": "Limpets always cling to rock.",
+      "applied": "Limpets cling to rock.",
+      "original": "Limpets always cling to rock."
+    },
+    {
+      "name": "a replacement",
+      "segments": [{ "text": "The " }, { "text": "crab", "mark": "del" }, { "text": "whelk", "mark": "ins" }, { "text": " hunts at night." }],
+      "written": "The crabwhelk hunts at night.",
+      "applied": "The whelk hunts at night.",
+      "original": "The crab hunts at night."
+    },
+    {
+      "name": "marks at both ends",
+      "segments": [{ "text": "Low tide. ", "mark": "ins" }, { "text": "Anemones close." }, { "text": " Gulls call.", "mark": "del" }],
+      "written": "Low tide. Anemones close. Gulls call.",
+      "applied": "Low tide. Anemones close.",
+      "original": "Anemones close. Gulls call."
+    }
+  ]
+}

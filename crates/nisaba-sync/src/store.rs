@@ -11,6 +11,13 @@ pub struct Stored {
     pub log: Vec<Vec<u8>>,
 }
 
+/// How much log a project has since its snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogSize {
+    pub entries: usize,
+    pub bytes: usize,
+}
+
 /// Durable storage for the rooms. The room calls these methods on a blocking
 /// thread, so they may block on disk.
 pub trait RoomStore: Send + Sync + 'static {
@@ -28,9 +35,13 @@ pub trait RoomStore: Send + Sync + 'static {
     ) -> Result<bool, String>;
 
     /// Replaces the snapshot and removes every log entry that `covers`
-    /// includes, in one atomic step.
-    fn compact(&self, project: &str, covers: &VersionVector, snapshot: &[u8])
-    -> Result<(), String>;
+    /// includes, in one atomic step. Returns what is left in the log.
+    fn compact(
+        &self,
+        project: &str,
+        covers: &VersionVector,
+        snapshot: &[u8],
+    ) -> Result<LogSize, String>;
 }
 
 /// A store in memory, for tests.
@@ -70,7 +81,7 @@ impl RoomStore for MemoryStore {
         project: &str,
         covers: &VersionVector,
         snapshot: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<LogSize, String> {
         let mut map = self.0.lock().unwrap();
         let stored = map.entry(project.to_owned()).or_default();
         stored.snapshot = Some(snapshot.to_vec());
@@ -78,6 +89,9 @@ impl RoomStore for MemoryStore {
             loro::LoroDoc::decode_import_blob_meta(u, false)
                 .map_or(true, |m| !covers.includes_vv(&m.partial_end_vv))
         });
-        Ok(())
+        Ok(LogSize {
+            entries: stored.log.len(),
+            bytes: stored.log.iter().map(Vec::len).sum(),
+        })
     }
 }
