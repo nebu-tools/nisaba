@@ -22,7 +22,7 @@ const p95 = (xs) => [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.f
 const round = (x) => Math.round(x)
 
 const spawnAt = performance.now()
-const server = spawn(binary, ["--data", data, "--listen", "127.0.0.1:0"], { stdio: ["ignore", "pipe", "inherit"] })
+const server = spawn(binary, ["serve", "--data", data, "--listen", "127.0.0.1:0"], { stdio: ["ignore", "pipe", "inherit"] })
 const base = await new Promise((resolve, reject) => {
   server.stdout.on("data", (chunk) => {
     const m = /listening on (http:\/\/\S+)/.exec(String(chunk))

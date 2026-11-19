@@ -29,29 +29,254 @@ pub const PART: usize = 1 << 20;
 /// The bytes an Update frame adds to its update: the type and the length.
 pub const UPDATE_HEADER: usize = 5;
 
-/// WebSocket close codes the server sends.
+/// WebSocket close codes. [`close::ALL`] describes each one; the API
+/// description and the web client's generated types are made from it.
 pub mod close {
     pub const NORMAL: u16 = 1000;
-    /// The server holds as many unfinished updates as it may; send the
-    /// update again after a delay.
+    /// The server is stopping or restarting.
+    pub const RESTARTING: u16 = 1012;
+    /// Try again later: another large update holds the space this one needs.
     pub const TRY_AGAIN: u16 = 1013;
     pub const MALFORMED: u16 = 4000;
     pub const TOO_SLOW: u16 = 4002;
+    /// The user's role does not allow the update, or no longer allows writing.
+    pub const FORBIDDEN: u16 = 4003;
+    /// The project does not exist, the user is not a member, stopped being
+    /// one, or the project was deleted.
+    pub const NOT_FOUND: u16 = 4004;
     /// A multi-part update did not arrive by its deadline. Nothing of it was
     /// kept; send it again after reconnecting.
     pub const TIMED_OUT: u16 = 4008;
-    pub const FORBIDDEN: u16 = 4003;
-    /// The project does not exist or the user is not a member, or no longer
-    /// one.
-    pub const NOT_FOUND: u16 = 4004;
     pub const FULL: u16 = 4029;
     /// The update does not fit in what the project has left.
     pub const TOO_LARGE: u16 = 4130;
     pub const VERSION: u16 = 4400;
-    /// The session is missing, expired or signed out; sign in again.
+    /// The session is missing, expired, signed out, or its account is gone.
     pub const SIGNED_OUT: u16 = 4401;
+    /// Planned with the project archive: the project's document was replaced.
+    pub const REPLACED: u16 = 4409;
     pub const SERVER_ERROR: u16 = 4500;
+
+    /// One close code, what it means and what the client does.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Code {
+        pub code: u16,
+        /// A stable name, used for the constant in the web client.
+        pub name: &'static str,
+        pub meaning: &'static str,
+        pub action: &'static str,
+        /// The client sees this code, but the server never sends it: 1006
+        /// is the browser's own, 4409 is planned.
+        pub sent: bool,
+    }
+
+    /// Every close code a client can see.
+    pub const ALL: &[Code] = &[
+        Code {
+            code: NORMAL,
+            name: "normal",
+            meaning: "Normal close.",
+            action: "Reconnect when the page needs the project again.",
+            sent: true,
+        },
+        Code {
+            code: 1006,
+            name: "lost",
+            meaning: "The connection was lost. The browser reports this code; no server sends it.",
+            action: "Reconnect with backoff.",
+            sent: false,
+        },
+        Code {
+            code: RESTARTING,
+            name: "restarting",
+            meaning: "The server is stopping. It finished every update it had received.",
+            action: "Reconnect with backoff.",
+            sent: true,
+        },
+        Code {
+            code: TRY_AGAIN,
+            name: "tryAgain",
+            meaning: "Try again later: the server holds too many large updates in parts at once, \
+                      or an unfinished one holds the space this update needs in its project.",
+            action: "Reconnect with backoff and send again.",
+            sent: true,
+        },
+        Code {
+            code: MALFORMED,
+            name: "malformed",
+            meaning: "A malformed frame, or parts out of order.",
+            action: "Reconnect with backoff. After three in a row with no Ack between them, \
+                     stop and show \"Sync failed\" with a Reload button.",
+            sent: true,
+        },
+        Code {
+            code: TOO_SLOW,
+            name: "tooSlow",
+            meaning: "The client did not read its frames: its queue on the server filled, or one \
+                      frame waited 30 s to be sent.",
+            action: "Reconnect with backoff.",
+            sent: true,
+        },
+        Code {
+            code: FORBIDDEN,
+            name: "forbidden",
+            meaning: "The user's role does not allow this update, or the role changed so that \
+                      the user may no longer write.",
+            action: "Reload the role and continue read-only. Local changes stay in IndexedDB.",
+            sent: true,
+        },
+        Code {
+            code: NOT_FOUND,
+            name: "notFound",
+            meaning: "The project does not exist, the user is not a member, the user was removed \
+                      from it, or it was deleted.",
+            action: "Stop; the save state says \"Stopped\" with the reason.",
+            sent: true,
+        },
+        Code {
+            code: TIMED_OUT,
+            name: "timedOut",
+            meaning: "An update in parts did not finish before its deadline.",
+            action: "Reconnect with backoff and send again.",
+            sent: true,
+        },
+        Code {
+            code: FULL,
+            name: "full",
+            meaning: "Too many connections: the project has too many sockets, or the account \
+                      has 32 open.",
+            action: "Reconnect with backoff.",
+            sent: true,
+        },
+        Code {
+            code: TOO_LARGE,
+            name: "tooLarge",
+            meaning: "The update, or its declared length, does not fit beside what the project \
+                      stores, under its 32 MiB.",
+            action: "Stop; do not retry. The save state says \"Not saved: the project is full\".",
+            sent: true,
+        },
+        Code {
+            code: VERSION,
+            name: "version",
+            meaning: "The client speaks another protocol version.",
+            action: "Show \"Nisaba was updated. Reload to continue.\"",
+            sent: true,
+        },
+        Code {
+            code: SIGNED_OUT,
+            name: "signedOut",
+            meaning: "No valid session: never had one, signed out, signed out everywhere, \
+                      expired, ended by a password change elsewhere, or the account was deleted.",
+            action: "Stop; the save state says \"Stopped\" with the reason. A reload shows the \
+                     sign-in screen.",
+            sent: true,
+        },
+        Code {
+            code: REPLACED,
+            name: "replaced",
+            meaning: "Planned with the project archive: the project's document was replaced.",
+            action: "Offer the unsent changes as a download, then clear the device log and reload.",
+            sent: false,
+        },
+        Code {
+            code: SERVER_ERROR,
+            name: "serverError",
+            meaning: "The server could not store the update, for example because its disk is \
+                      full.",
+            action: "Reconnect with backoff.",
+            sent: true,
+        },
+    ];
 }
+
+/// How one field of a frame is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    U8,
+    /// Big-endian.
+    U32,
+    /// A big-endian `u32` length and that many bytes.
+    Blob,
+}
+
+/// One frame type of the protocol, for the API description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameType {
+    pub tag: u8,
+    pub name: &'static str,
+    /// `"client"`, `"server"` or `"both"`: who sends it.
+    pub from: &'static str,
+    pub fields: &'static [(&'static str, FieldKind)],
+    pub meaning: &'static str,
+}
+
+/// Every frame type.
+pub const FRAMES: &[FrameType] = &[
+    FrameType {
+        tag: HELLO,
+        name: "hello",
+        from: "client",
+        fields: &[("protocol", FieldKind::U8), ("version", FieldKind::Blob)],
+        meaning: "Opens the session with the client's version vector, empty when it holds nothing.",
+    },
+    FrameType {
+        tag: WELCOME,
+        name: "welcome",
+        from: "server",
+        fields: &[("catchUp", FieldKind::Blob), ("version", FieldKind::Blob)],
+        meaning: "Every operation the client lacks, and the server's version vector.",
+    },
+    FrameType {
+        tag: UPDATE,
+        name: "update",
+        from: "both",
+        fields: &[("update", FieldKind::Blob)],
+        meaning: "A Loro update.",
+    },
+    FrameType {
+        tag: ACK,
+        name: "ack",
+        from: "server",
+        fields: &[("version", FieldKind::Blob)],
+        meaning: "The server's version vector after an update was committed.",
+    },
+    FrameType {
+        tag: PRESENCE,
+        name: "presence",
+        from: "both",
+        fields: &[("state", FieldKind::Blob)],
+        meaning: "Loro ephemeral-store bytes: cursors and selections.",
+    },
+    FrameType {
+        tag: HEARTBEAT,
+        name: "heartbeat",
+        from: "both",
+        fields: &[],
+        meaning: "Keeps the socket open. The server answers each one.",
+    },
+    FrameType {
+        tag: BEGIN,
+        name: "begin",
+        from: "both",
+        fields: &[("total", FieldKind::U32)],
+        meaning: "The length of the frame that follows in parts.",
+    },
+    FrameType {
+        tag: PART_TYPE,
+        name: "part",
+        from: "both",
+        fields: &[("index", FieldKind::U32), ("bytes", FieldKind::Blob)],
+        meaning: "One part of a long frame, numbered from 0.",
+    },
+];
+
+/// How often the client sends a Heartbeat.
+pub const HEARTBEAT_SECONDS: u64 = 20;
+/// A socket that sends nothing for this long is closed.
+pub const IDLE_SECONDS: u64 = 60;
+/// How long the server waits for the Hello.
+pub const HELLO_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -423,6 +648,72 @@ mod tests {
             prop_assert_eq!(feed(&mut a, rest), Ok(vec![]));
             prop_assert!(a.held() <= len + UPDATE_HEADER);
             prop_assert_eq!(feed(&mut a, std::slice::from_ref(last)), Ok(vec![Frame::Update(vec![7; len])]));
+        }
+    }
+
+    /// The table the API description is made from says what the code does.
+    #[test]
+    fn the_frame_table_matches_the_encoding() {
+        let samples = [
+            Frame::Hello {
+                protocol: 2,
+                version: vec![],
+            },
+            Frame::Welcome {
+                catch_up: vec![],
+                version: vec![],
+            },
+            Frame::Update(vec![]),
+            Frame::Ack(vec![]),
+            Frame::Presence(vec![]),
+            Frame::Heartbeat,
+            Frame::Begin { total: 1 },
+            Frame::Part {
+                index: 0,
+                bytes: vec![],
+            },
+        ];
+        assert_eq!(samples.len(), FRAMES.len());
+        for (frame, info) in samples.iter().zip(FRAMES) {
+            let bytes = frame.encode();
+            assert_eq!(bytes[0], info.tag, "{}", info.name);
+            let fixed: usize = info
+                .fields
+                .iter()
+                .map(|(_, kind)| match kind {
+                    FieldKind::U8 => 1,
+                    FieldKind::U32 | FieldKind::Blob => 4,
+                })
+                .sum();
+            assert_eq!(bytes.len(), 1 + fixed, "{}", info.name);
+        }
+    }
+
+    #[test]
+    fn every_close_code_is_described_once() {
+        let mut codes: Vec<u16> = close::ALL.iter().map(|c| c.code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), close::ALL.len());
+        let errors = [
+            SyncError::Busy,
+            SyncError::Unexpected,
+            SyncError::TooSlow,
+            SyncError::Forbidden,
+            SyncError::Full,
+            SyncError::TimedOut,
+            SyncError::TooLarge(1),
+            SyncError::Version { expected: 2 },
+            SyncError::Ended,
+            SyncError::Closed,
+            SyncError::Storage(String::new()),
+        ];
+        for e in errors {
+            let code = e.close_code();
+            assert!(
+                close::ALL.iter().any(|c| c.code == code && c.sent),
+                "{e:?} closes with {code}, which is not described as sent"
+            );
         }
     }
 

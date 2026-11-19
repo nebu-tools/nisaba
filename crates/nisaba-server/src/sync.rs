@@ -19,18 +19,18 @@ use std::time::Duration;
 use axum::extract::ws::{CloseFrame, Message};
 use futures_util::{Sink, SinkExt as _, Stream, StreamExt as _};
 use nisaba_sync::{
-    Assembler, Frame, Limits, PART, Reservation, Room, SyncError, UPDATE_HEADER, close, split,
+    Assembler, Frame, PART, Reservation, Room, SyncError, UPDATE_HEADER, close, split,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
 
-use crate::access::Grant;
+use crate::access::{End as Ended, Grant};
 use crate::store::Store;
 
 /// A client that sends nothing for this long is gone. Clients send a
 /// Heartbeat every 20 seconds.
-const IDLE: Duration = Duration::from_secs(60);
-const HELLO_WAIT: Duration = Duration::from_secs(10);
+const IDLE: Duration = Duration::from_secs(nisaba_sync::IDLE_SECONDS);
+const HELLO_WAIT: Duration = Duration::from_secs(nisaba_sync::HELLO_SECONDS);
 /// How long one message, at most a part of 1 MiB, may take to reach a
 /// client that is reading.
 const SEND_WAIT: Duration = Duration::from_secs(30);
@@ -51,14 +51,17 @@ pub fn transfer_time(total: usize) -> Duration {
 
 pub type ProjectRoom = Room<Store>;
 
+type Slot = Arc<OnceCell<Arc<ProjectRoom>>>;
+
 /// The open rooms, one per project.
 #[derive(Clone)]
 pub struct Rooms {
     store: Arc<Store>,
-    open: Arc<Mutex<HashMap<String, Arc<ProjectRoom>>>>,
-    opening: Arc<tokio::sync::Mutex<()>>,
+    open: Arc<Mutex<HashMap<String, Slot>>>,
     /// Bytes that unfinished multi-part frames may hold across all sockets.
     transfers: Arc<Semaphore>,
+    /// Set when the server stops; sockets close with 1012.
+    stopping: Arc<watch::Sender<bool>>,
 }
 
 impl Rooms {
@@ -67,26 +70,51 @@ impl Rooms {
         Self {
             store: Arc::new(store),
             open: Arc::default(),
-            opening: Arc::default(),
             transfers: Arc::new(Semaphore::new(transfer_bytes.min(Semaphore::MAX_PERMITS))),
+            stopping: Arc::new(watch::channel(false).0),
         }
     }
 
     /// The room for `project`, loaded from the store if it is not open.
+    /// Rooms of different projects open at the same time; two requests for
+    /// one project share one load.
     pub async fn get(&self, project: &str) -> Result<Arc<ProjectRoom>, SyncError> {
-        if let Some(room) = self.cached(project) {
-            return Ok(room);
+        let stopping = *self.stopping.borrow();
+        if stopping {
+            return Err(SyncError::Closed);
         }
-        let _guard = self.opening.lock().await;
-        if let Some(room) = self.cached(project) {
-            return Ok(room);
+        let slot = Arc::clone(self.lock().entry(project.to_owned()).or_default());
+        let room = slot
+            .get_or_try_init(|| async {
+                Room::open(project, Arc::clone(&self.store), crate::limits::room())
+                    .await
+                    .map(Arc::new)
+            })
+            .await;
+        match room {
+            Ok(room) => Ok(Arc::clone(room)),
+            Err(e) => {
+                // A load that failed leaves no slot behind, so the next
+                // request tries again.
+                let mut open = self.lock();
+                if open
+                    .get(project)
+                    .is_some_and(|s| Arc::ptr_eq(s, &slot) && s.get().is_none())
+                {
+                    open.remove(project);
+                }
+                Err(e)
+            }
         }
-        let room = Arc::new(Room::open(project, Arc::clone(&self.store), Limits::default()).await?);
-        self.open
-            .lock()
-            .expect("rooms lock")
-            .insert(project.to_owned(), Arc::clone(&room));
-        Ok(room)
+    }
+
+    /// Closes and forgets the room of a deleted project. Waits for the
+    /// update it is writing.
+    pub async fn evict(&self, project: &str) {
+        let slot = self.lock().remove(project);
+        if let Some(room) = slot.as_ref().and_then(|s| s.get()) {
+            room.close().await;
+        }
     }
 
     /// Closes every room that no socket and no request holds, so memory
@@ -94,10 +122,24 @@ impl Rooms {
     /// The room's state is already on disk.
     #[must_use]
     pub fn sweep(&self) -> usize {
-        let mut open = self.open.lock().expect("rooms lock");
+        let mut open = self.lock();
         let before = open.len();
-        open.retain(|_, room| Arc::strong_count(room) > 1);
+        open.retain(|_, slot| match slot.get() {
+            Some(room) => Arc::strong_count(room) > 1 || room.is_compacting(),
+            None => Arc::strong_count(slot) > 1,
+        });
         before - open.len()
+    }
+
+    /// How many rooms are open.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Sweeps every `every`.
@@ -112,8 +154,36 @@ impl Rooms {
         });
     }
 
-    fn cached(&self, project: &str) -> Option<Arc<ProjectRoom>> {
-        self.open.lock().expect("rooms lock").get(project).cloned()
+    /// Tells every socket to close with 1012 after the frame it is on, and
+    /// opens no room from now on.
+    pub fn stop(&self) {
+        self.stopping.send_replace(true);
+    }
+
+    /// Closes every room, waiting for the updates and compactions they are
+    /// writing. After this, nothing of any room is on its way to the store.
+    pub async fn quiesce(&self) {
+        let rooms: Vec<_> = self
+            .lock()
+            .values()
+            .filter_map(|s| s.get().cloned())
+            .collect();
+        for room in &rooms {
+            room.close().await;
+        }
+        // A compaction that made its snapshot before the close does not
+        // write it; wait until each has seen the close.
+        for room in rooms {
+            while room.is_compacting() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slot>> {
+        self.open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -131,28 +201,32 @@ impl<S> Socket for S where
 {
 }
 
-/// Sends the close frame if the client takes it within [`CLOSE_WAIT`]. The
-/// caller drops the socket afterwards either way.
-async fn close_with(socket: &mut impl Socket, code: u16, reason: &str) {
+/// Sends the close frame and reads, discarding, until the client answers
+/// it, all within [`CLOSE_WAIT`]. The caller drops the socket afterwards
+/// either way. Reading matters: a socket dropped with frames the client
+/// sent still unread ends with a TCP reset, and the client may then never
+/// see the close frame and its code.
+pub(crate) async fn close_with(socket: &mut impl Socket, code: u16, reason: &str) {
     let frame = Message::Close(Some(CloseFrame {
         code,
         reason: reason.to_owned().into(),
     }));
-    let _ = tokio::time::timeout(CLOSE_WAIT, socket.send(frame)).await;
+    let deadline = Instant::now() + CLOSE_WAIT;
+    if !matches!(
+        tokio::time::timeout_at(deadline, socket.send(frame)).await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
+    while let Ok(Some(Ok(message))) = tokio::time::timeout_at(deadline, socket.next()).await {
+        if matches!(message, Message::Close(_)) {
+            break;
+        }
+    }
 }
 
 async fn refuse(socket: &mut impl Socket, e: &SyncError) {
     close_with(socket, e.close_code(), &e.to_string()).await;
-}
-
-/// Why a grant ended, for the close frame.
-#[must_use]
-pub fn ended_reason(code: u16) -> &'static str {
-    if code == close::NOT_FOUND {
-        "you no longer have access to this project"
-    } else {
-        "signed out; sign in again"
-    }
 }
 
 /// Sends `frame`, in parts when it is long. Each message must go out within
@@ -172,8 +246,17 @@ enum End {
     /// The client closed or went quiet.
     Gone,
     Refused(SyncError),
-    /// The grant ended with this close code.
-    Ended(u16),
+    /// The grant ended.
+    Ended(Ended),
+    /// The server stops.
+    Stopping,
+}
+
+const STOPPING: &str = "the server is restarting";
+
+/// Resolves when the server stops. Cancel-safe.
+async fn stopped(stopping: &mut watch::Receiver<bool>) {
+    let _ = stopping.wait_for(|s| *s).await.map(drop);
 }
 
 /// A multi-part frame on its way in.
@@ -187,11 +270,17 @@ struct Transfer {
 
 /// Runs one client connection. Access was checked before the upgrade, and
 /// `grant` keeps the socket open only while that access lasts: a sign-out,
-/// an expired session, a deleted account or a removed membership closes it
-/// at once, even while a send waits on the client, and the room writes no
-/// update after that.
+/// an expired session, a deleted account, a removed membership or a deleted
+/// project closes it at once, even while a send waits on the client, and the
+/// room writes no update after that. A role change that takes away writing
+/// closes it with 4003; one that gives writing takes effect at once.
+///
+/// When the server stops, the socket closes with 1012 between frames, so an
+/// update that has arrived is written and acknowledged first.
+#[expect(clippy::too_many_lines, reason = "one loop over the socket's events")]
 pub async fn run(mut socket: impl Socket, rooms: Rooms, project: String, grant: Grant) {
     let mut ending = grant.ending();
+    let mut stopping = rooms.stopping.subscribe();
     let mut parts = Assembler::new(PART);
     let hello = match tokio::time::timeout(HELLO_WAIT, socket.next()).await {
         Ok(Some(Ok(Message::Binary(bytes)))) => parts.push(&bytes, |_| Err(SyncError::Unexpected)),
@@ -202,15 +291,23 @@ pub async fn run(mut socket: impl Socket, rooms: Rooms, project: String, grant: 
         Ok(None) => return refuse(&mut socket, &SyncError::Unexpected).await,
         Err(e) => return refuse(&mut socket, &e).await,
     };
-    if let Some(code) = grant.ended() {
-        return close_with(&mut socket, code, ended_reason(code)).await;
+    if let Some(end) = grant.ended() {
+        return close_with(&mut socket, end.code, end.reason).await;
     }
     let room = match rooms.get(&project).await {
         Ok(room) => room,
+        Err(SyncError::Closed) => {
+            return close_with(&mut socket, close::RESTARTING, STOPPING).await;
+        }
         Err(e) => return refuse(&mut socket, &e).await,
     };
-    let (peer, mut rx) = match room.join(grant.role, hello, grant.admits()) {
+    let (peer, mut rx) = match room.join(hello, grant.access()) {
         Ok(joined) => joined,
+        Err(SyncError::Closed) => {
+            let end = grant.ended();
+            let (code, reason) = end.map_or((close::RESTARTING, STOPPING), |e| (e.code, e.reason));
+            return close_with(&mut socket, code, reason).await;
+        }
         Err(e) => return refuse(&mut socket, &e).await,
     };
     let mut transfer: Option<Transfer> = None;
@@ -219,14 +316,15 @@ pub async fn run(mut socket: impl Socket, rooms: Rooms, project: String, grant: 
         let expired = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now));
         tokio::select! {
             biased;
-            code = ending.wait() => break End::Ended(code),
+            end = ending.wait() => break End::Ended(end),
+            () = stopped(&mut stopping) => break End::Stopping,
             () = expired, if deadline.is_some() => break End::Refused(SyncError::TimedOut),
             frame = rx.recv() => {
                 let Some(frame) = frame else { break End::Refused(SyncError::TooSlow) };
                 let expired = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now));
                 tokio::select! {
                     biased;
-                    code = ending.wait() => break End::Ended(code),
+                    end = ending.wait() => break End::Ended(end),
                     () = expired, if deadline.is_some() => break End::Refused(SyncError::TimedOut),
                     sent = send(&mut socket, &frame) => if let Err(end) = sent { break end },
                 }
@@ -238,8 +336,8 @@ pub async fn run(mut socket: impl Socket, rooms: Rooms, project: String, grant: 
                     Message::Close(_) => break End::Gone,
                     _ => continue,
                 };
-                if let Some(code) = grant.ended() {
-                    break End::Ended(code);
+                if let Some(end) = grant.ended() {
+                    break End::Ended(end);
                 }
                 let frame = match parts.push(&bytes, |total| {
                     let held = room.reserve(total.saturating_sub(UPDATE_HEADER))?;
@@ -261,8 +359,17 @@ pub async fn run(mut socket: impl Socket, rooms: Rooms, project: String, grant: 
                 let held = transfer.take().map(|t| t.held);
                 match room.receive(peer, frame, held).await {
                     Ok(()) => {}
-                    Err(SyncError::Ended) => {
-                        break End::Ended(grant.ended().unwrap_or(close::SIGNED_OUT));
+                    Err(SyncError::Ended | SyncError::Forbidden) if grant.ended().is_some() => {
+                        break End::Ended(grant.ended().unwrap_or(crate::access::End {
+                            code: close::SIGNED_OUT,
+                            reason: "signed out; sign in again",
+                        }));
+                    }
+                    Err(SyncError::Closed) => {
+                        break match grant.ended() {
+                            Some(end) => End::Ended(end),
+                            None => End::Stopping,
+                        };
                     }
                     Err(e) => break End::Refused(e),
                 }
@@ -270,16 +377,17 @@ pub async fn run(mut socket: impl Socket, rooms: Rooms, project: String, grant: 
         }
     };
     room.leave(peer);
-    // Whatever was on its way in is given back before the close, which may
-    // wait on the client.
-    drop((transfer, parts));
+    // Whatever was on its way in, and the grant, are given back before the
+    // close, which may wait on the client.
+    drop((transfer, parts, ending, grant));
     match end {
         End::Gone => {}
         End::Refused(e) => {
-            tracing::info!(project, error = %e, "closing sync session");
+            tracing::info!(project, code = e.close_code(), "closing a sync socket");
             refuse(&mut socket, &e).await;
         }
-        End::Ended(code) => close_with(&mut socket, code, ended_reason(code)).await,
+        End::Ended(end) => close_with(&mut socket, end.code, end.reason).await,
+        End::Stopping => close_with(&mut socket, close::RESTARTING, STOPPING).await,
     }
 }
 
@@ -383,8 +491,19 @@ mod tests {
     fn setup(budget: usize) -> Setup {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        store.create_user("u", "u@example.org", "U", "x").unwrap();
-        store.create_session("t", "u", 86_400).unwrap();
+        store
+            .create_account(
+                &crate::api::User {
+                    id: "u".into(),
+                    email: "u@example.org".into(),
+                    name: "U".into(),
+                    is_admin: false,
+                },
+                "x",
+            )
+            .unwrap()
+            .unwrap();
+        store.create_session("t", "u").unwrap();
         store.create_project("p", "P", "u").unwrap();
         store.create_project("q", "Q", "u").unwrap();
         let rooms = Rooms::new(store.clone(), budget);
@@ -537,7 +656,9 @@ mod tests {
         let room = s.rooms.get("p").await.unwrap();
         let a = s.connect("p", 0).await;
         for word in ["one", "two", "three"] {
-            room.apply(&edit(word)).await.unwrap();
+            room.apply(&edit(word), &nisaba_sync::always(nisaba_sync::Role::Editor))
+                .await
+                .unwrap();
         }
         let start = Instant::now();
         tokio::time::timeout(Duration::from_secs(600), a.session)
@@ -558,7 +679,9 @@ mod tests {
         let room = s.rooms.get("p").await.unwrap();
         let a = s.connect("p", 0).await;
         for word in ["one", "two", "three"] {
-            room.apply(&edit(word)).await.unwrap();
+            room.apply(&edit(word), &nisaba_sync::always(nisaba_sync::Role::Editor))
+                .await
+                .unwrap();
         }
         // The session is now stuck in a send the client never takes.
         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -578,7 +701,9 @@ mod tests {
         let s = setup(BUDGET);
         let room = s.rooms.get("p").await.unwrap();
         let big = noise(6 << 20);
-        room.apply(&edit(&big)).await.unwrap();
+        room.apply(&edit(&big), &nisaba_sync::always(nisaba_sync::Role::Editor))
+            .await
+            .unwrap();
         let grant = s.store.grant("t", "p").unwrap().unwrap();
         let (tx, from_client) = mpsc::unbounded();
         let (to_client, mut rx) = mpsc::channel(0);

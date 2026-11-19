@@ -1,0 +1,3837 @@
+{
+  "components": {
+    "schemas": {
+      "AccountChange": {
+        "additionalProperties": false,
+        "description": "`PATCH /api/account`.",
+        "properties": {
+          "name": {
+            "description": "The new display name, 1 to 100 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "ApiError": {
+        "description": "Every error the API answers has this shape.",
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "Stable: the client may branch on it."
+          },
+          "field": {
+            "description": "The request field the error is about, when there is one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "description": "A sentence a person can read. It may change between versions.",
+            "type": "string"
+          },
+          "problems": {
+            "description": "The compile problems of a failed export.",
+            "items": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "retry_after": {
+            "description": "When to try again, in seconds; also sent as `Retry-After`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "AssetAdded": {
+        "description": "The content hash of an uploaded asset.",
+        "properties": {
+          "hash": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hash"
+        ],
+        "type": "object"
+      },
+      "AssetQuery": {
+        "additionalProperties": false,
+        "description": "The query of `POST /api/projects/{project}/assets`.",
+        "properties": {
+          "path": {
+            "description": "Where the file goes in the project, such as `figures/limpet.png`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "Credentials": {
+        "additionalProperties": false,
+        "description": "`POST /api/login`.",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "type": "object"
+      },
+      "ErrorCode": {
+        "description": "The stable error codes. `ERROR_STATUS` gives the HTTP status of each,\nand the API description what each means.",
+        "enum": [
+          "invalid_request",
+          "invalid_field",
+          "not_signed_in",
+          "wrong_credentials",
+          "wrong_setup_code",
+          "cross_origin",
+          "forbidden",
+          "not_found",
+          "method_not_allowed",
+          "setup_done",
+          "email_taken",
+          "already_member",
+          "last_owner",
+          "sole_owner",
+          "last_admin",
+          "payload_too_large",
+          "project_full",
+          "range_not_satisfiable",
+          "compile_failed",
+          "export_out_of_memory",
+          "export_out_of_time",
+          "too_many_attempts",
+          "internal",
+          "package_unavailable",
+          "busy",
+          "try_again",
+          "export_busy",
+          "exports_off",
+          "stopping",
+          "web_client_missing",
+          "storage_full"
+        ],
+        "type": "string"
+      },
+      "ExportMode": {
+        "enum": [
+          "sandboxed",
+          "unsandboxed",
+          "off"
+        ],
+        "type": "string"
+      },
+      "ExportQuery": {
+        "additionalProperties": false,
+        "description": "The query of `GET /api/projects/{project}/export.pdf`.",
+        "properties": {
+          "standard": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Standard"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Default `pdf`."
+          },
+          "today": {
+            "default": null,
+            "description": "The caller's local date, `YYYY-MM-DD`. Used when it lies within one\nday of the server's UTC date; otherwise the UTC date is used.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "view": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/View"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Which text of tracked changes to typeset. Default `written`."
+          }
+        },
+        "type": "object"
+      },
+      "FileEntry": {
+        "description": "One file of `GET /api/projects/{project}/files`: `text` for sources,\n`hash` for assets.",
+        "properties": {
+          "hash": {
+            "description": "The SHA-256 of an asset's bytes, in hex.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "The file's id in the document; random, never reused.",
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ],
+        "type": "object"
+      },
+      "FontCatalogueEntry": {
+        "description": "One entry of `fonts.json`.",
+        "properties": {
+          "file": {
+            "description": "The font file, relative to `/fonts/`.",
+            "type": "string"
+          },
+          "index": {
+            "description": "The face's index inside the file.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "info": {
+            "description": "Typst's description of the face: family, variant, coverage."
+          }
+        },
+        "required": [
+          "file",
+          "index",
+          "info"
+        ],
+        "type": "object"
+      },
+      "Health": {
+        "description": "`GET /api/health`.",
+        "properties": {
+          "exports": {
+            "$ref": "#/components/schemas/ExportMode",
+            "description": "Whether exports run: in the sandbox, without it, or not at all."
+          },
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus",
+            "description": "`ok` while the server can read its database and is not stopping."
+          },
+          "version": {
+            "description": "The server's version.",
+            "type": "string"
+          },
+          "web_client": {
+            "description": "Whether this binary holds the web client.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "version",
+          "web_client",
+          "exports"
+        ],
+        "type": "object"
+      },
+      "HealthStatus": {
+        "enum": [
+          "ok",
+          "failing",
+          "stopping"
+        ],
+        "type": "string"
+      },
+      "ImportFile": {
+        "additionalProperties": false,
+        "description": "A file in a new project: `text` for sources, `base64` for assets.",
+        "properties": {
+          "base64": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "A relative path such as `chapters/tides.typ`.",
+            "type": "string"
+          },
+          "text": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "Member": {
+        "description": "One member of a project.",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "email",
+          "name",
+          "role"
+        ],
+        "type": "object"
+      },
+      "NewAccount": {
+        "additionalProperties": false,
+        "description": "`POST /api/admin/users`: an account made by an administrator.",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "is_admin": {
+            "default": false,
+            "type": "boolean"
+          },
+          "name": {
+            "default": "",
+            "description": "The display name; the email when empty.",
+            "type": "string"
+          },
+          "password": {
+            "description": "At least 8 characters. The person changes it after signing in.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "type": "object"
+      },
+      "NewMember": {
+        "additionalProperties": false,
+        "description": "`POST /api/projects/{project}/members`: adds the account with this\nemail.",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          }
+        },
+        "required": [
+          "email",
+          "role"
+        ],
+        "type": "object"
+      },
+      "NewProject": {
+        "additionalProperties": false,
+        "description": "`POST /api/projects`.",
+        "properties": {
+          "files": {
+            "default": [],
+            "description": "The first files. Without any, the project gets a `main.typ`.",
+            "items": {
+              "$ref": "#/components/schemas/ImportFile"
+            },
+            "type": "array"
+          },
+          "name": {
+            "description": "1 to 200 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "PasswordChange": {
+        "additionalProperties": false,
+        "description": "`POST /api/account/password`. Every other session of the account ends.",
+        "properties": {
+          "current_password": {
+            "type": "string"
+          },
+          "new_password": {
+            "description": "At least 8 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "type": "object"
+      },
+      "Problem": {
+        "description": "A compile problem in an export that failed.",
+        "properties": {
+          "end": {
+            "description": "End of the range, as a UTF-16 offset.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "path": {
+            "description": "The project file the problem points into, when Typst named one. A\nfile of a package is written `@namespace/name:version/path`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "severity": {
+            "description": "`error` or `warning`.",
+            "type": "string"
+          },
+          "start": {
+            "description": "Start of the range, as a UTF-16 offset.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "severity",
+          "message",
+          "path",
+          "start",
+          "end"
+        ],
+        "type": "object"
+      },
+      "Project": {
+        "description": "A project as the project list shows it.",
+        "properties": {
+          "created_at": {
+            "description": "Seconds since 1970.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "The caller's role in it."
+          },
+          "updated_at": {
+            "description": "The last change to its document or name, to the minute, in seconds\nsince 1970. The list is sorted by it, newest first.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "role",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "ProjectChange": {
+        "additionalProperties": false,
+        "description": "`PATCH /api/projects/{project}`.",
+        "properties": {
+          "name": {
+            "description": "1 to 200 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "Role": {
+        "description": "A role in one project. DESIGN.md section 6 lists what each may do. A\ncommenter may not change the document until build step N4 adds the\ncheck of suggestions, so today a commenter reads like a viewer.",
+        "enum": [
+          "owner",
+          "editor",
+          "commenter",
+          "viewer"
+        ],
+        "type": "string"
+      },
+      "RoleChange": {
+        "additionalProperties": false,
+        "description": "`PATCH /api/projects/{project}/members/{user}`.",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "type": "object"
+      },
+      "Session": {
+        "description": "`GET /api/session`: what the client needs to pick its first screen.",
+        "properties": {
+          "expires_at": {
+            "description": "When the session ends, in seconds since 1970, or null without one.\nThe server moves it forward when this route is called, at most once\na day, up to 90 days after sign-in.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "setup_code_needed": {
+            "description": "Setup asks for the code the server printed to its log.",
+            "type": "boolean"
+          },
+          "setup_needed": {
+            "description": "No account exists yet.",
+            "type": "boolean"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/User"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The signed-in person, or null."
+          }
+        },
+        "required": [
+          "setup_needed",
+          "setup_code_needed",
+          "user",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "SetupRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/setup`: the first account, which is the administrator.",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "description": "The display name; the email when empty.",
+            "type": "string"
+          },
+          "password": {
+            "description": "At least 8 characters.",
+            "type": "string"
+          },
+          "setup_code": {
+            "default": null,
+            "description": "The code from the server log; needed unless the server is reachable\nonly from this machine.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "type": "object"
+      },
+      "Standard": {
+        "oneOf": [
+          {
+            "const": "pdf",
+            "description": "Typst's normal PDF.",
+            "type": "string"
+          },
+          {
+            "const": "pdf-a-2b",
+            "description": "PDF/A-2b, for archiving.",
+            "type": "string"
+          }
+        ]
+      },
+      "User": {
+        "description": "A person with an account, without the password hash.",
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "is_admin": {
+            "description": "Server administrators manage accounts. Being one gives no access to\nprojects.",
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "name",
+          "is_admin"
+        ],
+        "type": "object"
+      },
+      "View": {
+        "description": "The text of a document with tracked changes (DESIGN.md section 5).",
+        "oneOf": [
+          {
+            "const": "written",
+            "description": "The text as it is, with suggested insertions and deletions both present.",
+            "type": "string"
+          },
+          {
+            "const": "applied",
+            "description": "Suggested deletions removed, suggested insertions kept.",
+            "type": "string"
+          },
+          {
+            "const": "original",
+            "description": "Suggested insertions removed, suggested deletions kept.",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    "securitySchemes": {
+      "session": {
+        "description": "The session cookie: `__Host-nisaba_session` behind an https public address, `nisaba_session` behind plain http.",
+        "in": "cookie",
+        "name": "nisaba_session",
+        "type": "apiKey"
+      }
+    }
+  },
+  "info": {
+    "description": "The HTTP API and the sync protocol of the Nisaba server. Every error answer is an ApiError. Every request other than GET and HEAD must carry an Origin header equal to the server's public address. Generated from crates/nisaba-server/src/api; do not edit.",
+    "title": "Nisaba",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "web_client",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html; charset=utf-8": {}
+            },
+            "description": "OK"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "x-nisaba-error-codes": [
+              "web_client_missing"
+            ]
+          }
+        },
+        "summary": "The web client. Every path no other route takes gets its `index.html`, except under `/assets/`, `/fonts/`, `/api/`, `/packages/` and `/sync/`.",
+        "x-nisaba-auth": "anyone"
+      }
+    },
+    "/api/account": {
+      "patch": {
+        "operationId": "account_update",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "name": "Tide curator"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/AccountChange"
+              }
+            }
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 65536
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request",
+              "invalid_field"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Changes the display name.",
+        "x-nisaba-auth": "session"
+      }
+    },
+    "/api/account/password": {
+      "post": {
+        "operationId": "password_change",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "current_password": "barnacle tide",
+                "new_password": "barnacle tide"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/PasswordChange"
+              }
+            }
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 65536
+        },
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request",
+              "invalid_field"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in",
+              "wrong_credentials"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large"
+            ]
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Too Many Requests",
+            "x-nisaba-error-codes": [
+              "too_many_attempts"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "x-nisaba-error-codes": [
+              "busy"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Changes the password. Every other session of the account ends and its sync sockets close with 4401; this session stays. A wrong current password counts as a failed sign-in.",
+        "x-nisaba-auth": "session"
+      }
+    },
+    "/api/admin/users": {
+      "get": {
+        "operationId": "users_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/User"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "forbidden"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Every account, sorted by email.",
+        "x-nisaba-auth": "admin"
+      },
+      "post": {
+        "operationId": "user_create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "email": "warden@example.org",
+                "name": "Warden",
+                "password": "anemone pool"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/NewAccount"
+              }
+            }
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 65536
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request",
+              "invalid_field"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin",
+              "forbidden"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Conflict",
+            "x-nisaba-error-codes": [
+              "email_taken"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "x-nisaba-error-codes": [
+              "busy"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Makes an account with a first password.",
+        "x-nisaba-auth": "admin"
+      }
+    },
+    "/api/admin/users/{user}": {
+      "delete": {
+        "operationId": "user_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin",
+              "forbidden"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Conflict",
+            "x-nisaba-error-codes": [
+              "sole_owner",
+              "last_admin"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Deletes an account, its sessions and its memberships. Its sync sockets close with 4401. Refused while it is the only owner of a project, or the last administrator.",
+        "x-nisaba-auth": "admin"
+      }
+    },
+    "/api/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Whether the server can read its database. Answers 503 with the same body while it cannot, and while it stops.",
+        "x-nisaba-auth": "anyone"
+      }
+    },
+    "/api/login": {
+      "post": {
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "email": "curator@example.org",
+                "password": "barnacle tide"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 65536
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "wrong_credentials"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large"
+            ]
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Too Many Requests",
+            "x-nisaba-error-codes": [
+              "too_many_attempts"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "x-nisaba-error-codes": [
+              "busy"
+            ]
+          }
+        },
+        "summary": "Signs in and sets the session cookie.",
+        "x-nisaba-auth": "anyone"
+      }
+    },
+    "/api/logout": {
+      "post": {
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "summary": "Ends this session and closes its sync sockets with 4401. Works without a session too.",
+        "x-nisaba-auth": "anyone"
+      }
+    },
+    "/api/logout-everywhere": {
+      "post": {
+        "operationId": "logout_everywhere",
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Ends every session of the account, this one too, and closes their sync sockets with 4401.",
+        "x-nisaba-auth": "session"
+      }
+    },
+    "/api/projects": {
+      "get": {
+        "operationId": "projects_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Project"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "The projects the caller is a member of, most recently changed first.",
+        "x-nisaba-auth": "session"
+      },
+      "post": {
+        "operationId": "project_create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "files": [
+                  {
+                    "path": "main.typ",
+                    "text": "= Rock pools\n"
+                  }
+                ],
+                "name": "Rock pools"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/NewProject"
+              }
+            }
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 67108864
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request",
+              "invalid_field"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large",
+              "project_full"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "507": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient Storage",
+            "x-nisaba-error-codes": [
+              "storage_full"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Makes a project with the caller as its owner.",
+        "x-nisaba-auth": "session"
+      }
+    },
+    "/api/projects/{project}": {
+      "delete": {
+        "operationId": "project_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin",
+              "forbidden"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Deletes a project: its document, history, memberships and the asset files no other project holds. Its sync sockets close with 4004.",
+        "x-nisaba-auth": "owner"
+      },
+      "get": {
+        "operationId": "project_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "One project.",
+        "x-nisaba-auth": "member"
+      },
+      "patch": {
+        "operationId": "project_update",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "name": "Rock pools of the north shore"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/ProjectChange"
+              }
+            }
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 65536
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request",
+              "invalid_field"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin",
+              "forbidden"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Renames a project.",
+        "x-nisaba-auth": "owner"
+      }
+    },
+    "/api/projects/{project}/assets": {
+      "post": {
+        "operationId": "asset_upload",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Where the file goes in the project, such as `figures/limpet.png`.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {}
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 33554432
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetAdded"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request",
+              "invalid_field"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin",
+              "forbidden"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large",
+              "project_full"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "x-nisaba-error-codes": [
+              "try_again"
+            ]
+          },
+          "507": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient Storage",
+            "x-nisaba-error-codes": [
+              "storage_full"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Stores the body as an asset of the project and adds a file entry for it at `path`.",
+        "x-nisaba-auth": "editor",
+        "x-nisaba-query": {
+          "$ref": "#/components/schemas/AssetQuery"
+        }
+      }
+    },
+    "/api/projects/{project}/assets/{hash}": {
+      "get": {
+        "operationId": "asset_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hash",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "OK"
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "Partial Content"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "416": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Range Not Satisfiable",
+            "x-nisaba-error-codes": [
+              "range_not_satisfiable"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "The bytes of an asset the project holds. Takes one byte range (`Range: bytes=a-b`) and answers 206.",
+        "x-nisaba-auth": "member"
+      }
+    },
+    "/api/projects/{project}/export.pdf": {
+      "get": {
+        "operationId": "export",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default `pdf`.",
+            "in": "query",
+            "name": "standard",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/Standard"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          {
+            "description": "The caller's local date, `YYYY-MM-DD`. Used when it lies within one\nday of the server's UTC date; otherwise the UTC date is used.",
+            "in": "query",
+            "name": "today",
+            "required": false,
+            "schema": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Which text of tracked changes to typeset. Default `written`.",
+            "in": "query",
+            "name": "view",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/View"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/pdf": {}
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unprocessable Content",
+            "x-nisaba-error-codes": [
+              "compile_failed",
+              "export_out_of_memory",
+              "export_out_of_time"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "x-nisaba-error-codes": [
+              "export_busy",
+              "exports_off",
+              "stopping"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Typesets the project as the server holds it now and answers the PDF.",
+        "x-nisaba-auth": "member",
+        "x-nisaba-query": {
+          "$ref": "#/components/schemas/ExportQuery"
+        }
+      }
+    },
+    "/api/projects/{project}/files": {
+      "get": {
+        "operationId": "files",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/FileEntry"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Every file of the project as the server holds it now, sorted by path.",
+        "x-nisaba-auth": "member"
+      }
+    },
+    "/api/projects/{project}/members": {
+      "get": {
+        "operationId": "members_list",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Member"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "The members of a project, sorted by name.",
+        "x-nisaba-auth": "member"
+      },
+      "post": {
+        "operationId": "member_add",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "email": "warden@example.org",
+                "role": "viewer"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/NewMember"
+              }
+            }
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 65536
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Member"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request",
+              "invalid_field"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin",
+              "forbidden"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Conflict",
+            "x-nisaba-error-codes": [
+              "already_member"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Adds the account with this email to the project. An email with no account is an invalid field.",
+        "x-nisaba-auth": "owner"
+      }
+    },
+    "/api/projects/{project}/members/{user}": {
+      "delete": {
+        "operationId": "member_remove",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin",
+              "forbidden"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Conflict",
+            "x-nisaba-error-codes": [
+              "last_owner"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Removes a member: an owner removes anyone, any member removes themself. Their sync sockets to the project close with 4004.",
+        "x-nisaba-auth": "member"
+      },
+      "patch": {
+        "operationId": "member_update",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "role": "editor"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/RoleChange"
+              }
+            }
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 65536
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Member"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin",
+              "forbidden"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Conflict",
+            "x-nisaba-error-codes": [
+              "last_owner"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "Changes a member's role. A member who can no longer write has their sync sockets closed with 4003; one who now may write can do so at once.",
+        "x-nisaba-auth": "owner"
+      }
+    },
+    "/api/session": {
+      "get": {
+        "operationId": "session",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "summary": "The signed-in person and whether setup is needed. Moves the session's end forward, at most once a day, and sends the cookie again when it does. The client calls this when it starts and at least once a day while it stays open.",
+        "x-nisaba-auth": "anyone"
+      }
+    },
+    "/api/setup": {
+      "post": {
+        "operationId": "setup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "email": "curator@example.org",
+                "name": "Curator",
+                "password": "barnacle tide"
+              },
+              "schema": {
+                "$ref": "#/components/schemas/SetupRequest"
+              }
+            }
+          },
+          "required": true,
+          "x-nisaba-max-bytes": 65536
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request",
+              "invalid_field"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin",
+              "wrong_setup_code"
+            ]
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Conflict",
+            "x-nisaba-error-codes": [
+              "setup_done"
+            ]
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Content Too Large",
+            "x-nisaba-error-codes": [
+              "payload_too_large"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "x-nisaba-error-codes": [
+              "busy"
+            ]
+          }
+        },
+        "summary": "First-run setup: makes the first account, the administrator, and signs it in.",
+        "x-nisaba-auth": "anyone"
+      }
+    },
+    "/fonts/fonts.json": {
+      "get": {
+        "operationId": "fonts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/FontCatalogueEntry"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "summary": "The catalogue of every font the server holds: the embedded ones and those in the data directory's `fonts/`. Revalidated on each visit.",
+        "x-nisaba-auth": "anyone"
+      }
+    },
+    "/fonts/{file}": {
+      "get": {
+        "operationId": "font_file",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "file",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "font/ttf": {}
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "summary": "One font file of the catalogue, named by its hash; cached for a year.",
+        "x-nisaba-auth": "anyone"
+      }
+    },
+    "/packages/{namespace}/{name}/{archive}": {
+      "get": {
+        "operationId": "package",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "archive",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/gzip": {}
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "x-nisaba-error-codes": [
+              "not_signed_in"
+            ]
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Not Found",
+            "x-nisaba-error-codes": [
+              "not_found"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Gateway",
+            "x-nisaba-error-codes": [
+              "package_unavailable"
+            ]
+          }
+        },
+        "security": [
+          {
+            "session": []
+          }
+        ],
+        "summary": "A Typst package as `.tar.gz`; `archive` is `{version}.tar.gz`. Served from the server's cache, which downloads a missing package from the registry when the server allows that.",
+        "x-nisaba-auth": "session"
+      }
+    },
+    "/sync/{project}": {
+      "get": {
+        "operationId": "sync",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching Protocols"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Bad Request",
+            "x-nisaba-error-codes": [
+              "invalid_request"
+            ]
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "x-nisaba-error-codes": [
+              "cross_origin"
+            ]
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Internal Server Error",
+            "x-nisaba-error-codes": [
+              "internal"
+            ]
+          }
+        },
+        "summary": "The sync socket (`x-nisaba-sync`). A handshake whose Origin is not the public address gets 403. Every other refusal is a close code after the upgrade.",
+        "x-nisaba-auth": "anyone"
+      }
+    }
+  },
+  "x-nisaba-errors": [
+    {
+      "code": "invalid_request",
+      "meaning": "The request could not be read: not JSON, a missing or unknown field, or a bad query or path.",
+      "status": 400
+    },
+    {
+      "code": "invalid_field",
+      "meaning": "A field has a value the server does not accept; `field` names it.",
+      "status": 400
+    },
+    {
+      "code": "not_signed_in",
+      "meaning": "No valid session: sign in first.",
+      "status": 401
+    },
+    {
+      "code": "wrong_credentials",
+      "meaning": "Wrong email or password, or wrong current password.",
+      "status": 401
+    },
+    {
+      "code": "wrong_setup_code",
+      "meaning": "The setup code is missing or wrong.",
+      "status": 403
+    },
+    {
+      "code": "cross_origin",
+      "meaning": "The request changes state and its Origin header is not this server's public address.",
+      "status": 403
+    },
+    {
+      "code": "forbidden",
+      "meaning": "The caller's role or account does not allow this.",
+      "status": 403
+    },
+    {
+      "code": "not_found",
+      "meaning": "No such thing, or the caller may not see it. A project the caller is not a member of is not found.",
+      "status": 404
+    },
+    {
+      "code": "method_not_allowed",
+      "meaning": "The path exists, but not with this method.",
+      "status": 405
+    },
+    {
+      "code": "setup_done",
+      "meaning": "The server already has an administrator.",
+      "status": 409
+    },
+    {
+      "code": "email_taken",
+      "meaning": "Another account has this email.",
+      "status": 409
+    },
+    {
+      "code": "already_member",
+      "meaning": "The account is already a member of the project.",
+      "status": 409
+    },
+    {
+      "code": "last_owner",
+      "meaning": "The project would have no owner left.",
+      "status": 409
+    },
+    {
+      "code": "sole_owner",
+      "meaning": "The account is the only owner of a project; delete the projects or give them another owner first.",
+      "status": 409
+    },
+    {
+      "code": "last_admin",
+      "meaning": "The server would have no administrator left.",
+      "status": 409
+    },
+    {
+      "code": "payload_too_large",
+      "meaning": "The request body is larger than this route takes.",
+      "status": 413
+    },
+    {
+      "code": "project_full",
+      "meaning": "The project is at its 32 MiB limit for text and history.",
+      "status": 413
+    },
+    {
+      "code": "range_not_satisfiable",
+      "meaning": "The byte range lies outside the file.",
+      "status": 416
+    },
+    {
+      "code": "compile_failed",
+      "meaning": "The document has errors; `problems` lists them.",
+      "status": 422
+    },
+    {
+      "code": "export_out_of_memory",
+      "meaning": "The export needed more memory than its limit.",
+      "status": 422
+    },
+    {
+      "code": "export_out_of_time",
+      "meaning": "The export took longer than its limit.",
+      "status": 422
+    },
+    {
+      "code": "too_many_attempts",
+      "meaning": "Too many failed sign-ins for this email; wait `retry_after`.",
+      "status": 429
+    },
+    {
+      "code": "internal",
+      "meaning": "The server failed. The log says why.",
+      "status": 500
+    },
+    {
+      "code": "package_unavailable",
+      "meaning": "The package registry could not be reached or sent something unusable.",
+      "status": 502
+    },
+    {
+      "code": "busy",
+      "meaning": "All password workers are busy; try again after `retry_after`.",
+      "status": 503
+    },
+    {
+      "code": "try_again",
+      "meaning": "A large update to this project is on its way and holds the space; try again in a minute.",
+      "status": 503
+    },
+    {
+      "code": "export_busy",
+      "meaning": "All export slots and the queue are full; try again in a minute.",
+      "status": 503
+    },
+    {
+      "code": "exports_off",
+      "meaning": "This server cannot sandbox exports and was not allowed to run them without.",
+      "status": 503
+    },
+    {
+      "code": "stopping",
+      "meaning": "The server is stopping; try again in a minute.",
+      "status": 503
+    },
+    {
+      "code": "web_client_missing",
+      "meaning": "This server was built without the web client.",
+      "status": 503
+    },
+    {
+      "code": "storage_full",
+      "meaning": "The server's disk is full; nothing was written.",
+      "status": 507
+    }
+  ],
+  "x-nisaba-limits": {
+    "assetBytes": 33554432,
+    "documentBytes": 33554432,
+    "emailMaxBytes": 254,
+    "importBytes": 67108864,
+    "nameMaxChars": 100,
+    "passwordMaxBytes": 1024,
+    "passwordMinChars": 8,
+    "pathMaxBytes": 512,
+    "presenceBytes": 65536,
+    "projectNameMaxChars": 200,
+    "requestBodyBytes": 65536,
+    "sessionMaxSeconds": 7776000,
+    "sessionSeconds": 2592000,
+    "socketsPerAccount": 32,
+    "socketsPerProject": 64
+  },
+  "x-nisaba-sync": {
+    "closeCodes": [
+      {
+        "action": "Reconnect when the page needs the project again.",
+        "code": 1000,
+        "meaning": "Normal close.",
+        "name": "normal",
+        "sent": true
+      },
+      {
+        "action": "Reconnect with backoff.",
+        "code": 1006,
+        "meaning": "The connection was lost. The browser reports this code; no server sends it.",
+        "name": "lost",
+        "sent": false
+      },
+      {
+        "action": "Reconnect with backoff.",
+        "code": 1012,
+        "meaning": "The server is stopping. It finished every update it had received.",
+        "name": "restarting",
+        "sent": true
+      },
+      {
+        "action": "Reconnect with backoff and send again.",
+        "code": 1013,
+        "meaning": "Try again later: the server holds too many large updates in parts at once, or an unfinished one holds the space this update needs in its project.",
+        "name": "tryAgain",
+        "sent": true
+      },
+      {
+        "action": "Reconnect with backoff. After three in a row with no Ack between them, stop and show \"Sync failed\" with a Reload button.",
+        "code": 4000,
+        "meaning": "A malformed frame, or parts out of order.",
+        "name": "malformed",
+        "sent": true
+      },
+      {
+        "action": "Reconnect with backoff.",
+        "code": 4002,
+        "meaning": "The client did not read its frames: its queue on the server filled, or one frame waited 30 s to be sent.",
+        "name": "tooSlow",
+        "sent": true
+      },
+      {
+        "action": "Reload the role and continue read-only. Local changes stay in IndexedDB.",
+        "code": 4003,
+        "meaning": "The user's role does not allow this update, or the role changed so that the user may no longer write.",
+        "name": "forbidden",
+        "sent": true
+      },
+      {
+        "action": "Stop; the save state says \"Stopped\" with the reason.",
+        "code": 4004,
+        "meaning": "The project does not exist, the user is not a member, the user was removed from it, or it was deleted.",
+        "name": "notFound",
+        "sent": true
+      },
+      {
+        "action": "Reconnect with backoff and send again.",
+        "code": 4008,
+        "meaning": "An update in parts did not finish before its deadline.",
+        "name": "timedOut",
+        "sent": true
+      },
+      {
+        "action": "Reconnect with backoff.",
+        "code": 4029,
+        "meaning": "Too many connections: the project has too many sockets, or the account has 32 open.",
+        "name": "full",
+        "sent": true
+      },
+      {
+        "action": "Stop; do not retry. The save state says \"Not saved: the project is full\".",
+        "code": 4130,
+        "meaning": "The update, or its declared length, does not fit beside what the project stores, under its 32 MiB.",
+        "name": "tooLarge",
+        "sent": true
+      },
+      {
+        "action": "Show \"Nisaba was updated. Reload to continue.\"",
+        "code": 4400,
+        "meaning": "The client speaks another protocol version.",
+        "name": "version",
+        "sent": true
+      },
+      {
+        "action": "Stop; the save state says \"Stopped\" with the reason. A reload shows the sign-in screen.",
+        "code": 4401,
+        "meaning": "No valid session: never had one, signed out, signed out everywhere, expired, ended by a password change elsewhere, or the account was deleted.",
+        "name": "signedOut",
+        "sent": true
+      },
+      {
+        "action": "Offer the unsent changes as a download, then clear the device log and reload.",
+        "code": 4409,
+        "meaning": "Planned with the project archive: the project's document was replaced.",
+        "name": "replaced",
+        "sent": false
+      },
+      {
+        "action": "Reconnect with backoff.",
+        "code": 4500,
+        "meaning": "The server could not store the update, for example because its disk is full.",
+        "name": "serverError",
+        "sent": true
+      }
+    ],
+    "frames": [
+      {
+        "fields": [
+          {
+            "kind": "u8",
+            "name": "protocol"
+          },
+          {
+            "kind": "blob",
+            "name": "version"
+          }
+        ],
+        "from": "client",
+        "meaning": "Opens the session with the client's version vector, empty when it holds nothing.",
+        "name": "hello",
+        "tag": 1
+      },
+      {
+        "fields": [
+          {
+            "kind": "blob",
+            "name": "catchUp"
+          },
+          {
+            "kind": "blob",
+            "name": "version"
+          }
+        ],
+        "from": "server",
+        "meaning": "Every operation the client lacks, and the server's version vector.",
+        "name": "welcome",
+        "tag": 2
+      },
+      {
+        "fields": [
+          {
+            "kind": "blob",
+            "name": "update"
+          }
+        ],
+        "from": "both",
+        "meaning": "A Loro update.",
+        "name": "update",
+        "tag": 3
+      },
+      {
+        "fields": [
+          {
+            "kind": "blob",
+            "name": "version"
+          }
+        ],
+        "from": "server",
+        "meaning": "The server's version vector after an update was committed.",
+        "name": "ack",
+        "tag": 4
+      },
+      {
+        "fields": [
+          {
+            "kind": "blob",
+            "name": "state"
+          }
+        ],
+        "from": "both",
+        "meaning": "Loro ephemeral-store bytes: cursors and selections.",
+        "name": "presence",
+        "tag": 5
+      },
+      {
+        "fields": [],
+        "from": "both",
+        "meaning": "Keeps the socket open. The server answers each one.",
+        "name": "heartbeat",
+        "tag": 6
+      },
+      {
+        "fields": [
+          {
+            "kind": "u32",
+            "name": "total"
+          }
+        ],
+        "from": "both",
+        "meaning": "The length of the frame that follows in parts.",
+        "name": "begin",
+        "tag": 7
+      },
+      {
+        "fields": [
+          {
+            "kind": "u32",
+            "name": "index"
+          },
+          {
+            "kind": "blob",
+            "name": "bytes"
+          }
+        ],
+        "from": "both",
+        "meaning": "One part of a long frame, numbered from 0.",
+        "name": "part",
+        "tag": 8
+      }
+    ],
+    "heartbeatSeconds": 20,
+    "helloSeconds": 10,
+    "idleSeconds": 60,
+    "partBytes": 1048576,
+    "path": "/sync/{project}",
+    "protocol": 2
+  }
+}

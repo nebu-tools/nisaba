@@ -75,6 +75,10 @@ jobs:
           uname -r
           cargo test --locked -p nisaba-server --test sandbox
 
-      # Includes the check that web/src/app/api.gen.ts matches the Rust types.
+      # Fails when api/openapi.json or web/src/app/api.gen.ts differs from
+      # what the server code makes.
+      - name: API description and web types are current
+        run: cargo test --locked -p nisaba-server --lib api::tests
+
       - name: cargo test
         run: cargo test --locked --workspace
